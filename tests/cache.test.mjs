@@ -22,6 +22,8 @@ test("expiry is exact, reads do not extend life, and least recently used entries
   now = 200; assert.equal(cache.get("a"), undefined);
   cache.set("expired", 4, now);
   assert.equal(cache.get("expired"), undefined);
+  cache.set("c", 3, now);
+  assert.equal(cache.get("c"), undefined, "An earlier expiry invalidates the previously cached value");
   cache.clear(); assert.equal(cache.get("c"), undefined);
 });
 

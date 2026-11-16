@@ -35,9 +35,9 @@ export class ExpiringCache {
     return entry.value;
   }
   set(key, value, expiresAt) {
+    this.entries.delete(key);
     if (!Number.isFinite(expiresAt) || expiresAt <= this.now()) return;
     for (const [key, entry] of this.entries) if (entry.expiresAt <= this.now()) this.entries.delete(key);
-    this.entries.delete(key);
     this.entries.set(key, { value, expiresAt });
     while (this.entries.size > this.limit) this.entries.delete(this.entries.keys().next().value);
   }
