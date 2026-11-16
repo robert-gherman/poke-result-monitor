@@ -353,6 +353,7 @@ function createResult(result) {
   const cachedCoordinates = coordinates.get(encounterKey(result));
   let coords = cachedCoordinates?.coords || "";
   let coordsExpireAt = cachedCoordinates ? Math.min(cachedCoordinates.expiresAt, coordinateExpiry(result)) : 0;
+  if (cachedCoordinates) coordinates.set(encounterKey(result), { coords, expiresAt: coordsExpireAt }, coordsExpireAt);
   let busy = false;
   const errorBox = node("div", "card-error");
   errorBox.setAttribute("role", "status");
