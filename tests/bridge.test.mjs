@@ -1,10 +1,84 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { handleBridge } from "../server/bridge.mjs";
+import { handleBridge, createSearchCache } from "../server/bridge.mjs";
 
 const origin = "https://robert-gherman.github.io";
 const request = (route, options = {}) => new Request(`https://test.vercel.app/api/bridge?route=${encodeURIComponent(route)}`, { headers: { Origin: origin }, ...options });
 const post = (body, headers = {}) => ({ method: "POST", headers: { Origin: origin, "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
+
+test("guest searches are shared, coalesced, bounded by TTL, and use each caller's CORS", async () => {
+  let now = Date.now();
+  let calls = 0;
+  let finish;
+  const cache = createSearchCache(() => now);
+  const upstream = async () => { calls++; await new Promise(resolve => { finish = resolve; }); return Response.json({ results: [{ pokemon_id: 25, encounter_id: "one" }] }); };
+  const first = handleBridge(request("search", post({ cp_min: 1, cp_max: 2 })), {}, upstream, cache);
+  for (let i = 0; !finish && i < 100; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.ok(finish, "The first search reaches the provider");
+  const second = handleBridge(request("search", post({ cp_max: 2, cp_min: 1 }, { Origin: "http://localhost:4173" })), {}, upstream, cache);
+  finish();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(calls, 1);
+  assert.equal(a.headers.get("access-control-allow-origin"), origin);
+  assert.equal(b.headers.get("access-control-allow-origin"), "http://localhost:4173");
+  now += 14999;
+  const hit = await handleBridge(request("search", post({ cp_min: 1, cp_max: 2 })), {}, upstream, cache);
+  assert.equal(hit.headers.get("x-pokesearch-cache"), "hit");
+  assert.equal(hit.headers.get("x-pokesearch-ttl-ms"), "1");
+  assert.equal(hit.headers.get("cache-control"), "no-store");
+  assert.equal(calls, 1);
+  now++;
+  const fresh = await handleBridge(request("search", post({ cp_min: 1, cp_max: 2 })), {}, async () => { calls++; return Response.json({ results: [] }); }, cache);
+  assert.equal(calls, 2);
+  assert.equal(fresh.headers.get("x-pokesearch-cache"), "miss");
+  assert.equal(fresh.headers.get("x-pokesearch-ttl-ms"), "5000");
+});
+
+test("accounts, authenticated/personalized searches, reveals and failures are never shared", async () => {
+  const cache = createSearchCache();
+  let calls = 0;
+  const upstream = async url => { calls++; return Response.json(url.endsWith("users/me") ? { is_vip: false } : url.includes("/reveal/") ? { coords: "1, 2" } : { results: [] }); };
+  for (const req of [() => request("account", { headers: { Authorization: "Bearer token" } }), () => request("search", post({ cp_min: 0 }, { Authorization: "Bearer token" })), () => request("search", post({ shiny_account: "personal" })), () => request("reveal/code")]) {
+    await handleBridge(req(), {}, upstream, cache);
+    await handleBridge(req(), {}, upstream, cache);
+  }
+  assert.equal(calls, 8);
+  for (const response of [() => Response.json({ detail: "limit" }, { status: 429 }), () => Response.json({}, { status: 401 }), () => Response.json({ results: [null] }), () => new Response("broken")]) {
+    const fetcher = async () => { calls++; return response(); };
+    const before = calls;
+    for (let i = 0; i < 2; i++) assert.notEqual((await handleBridge(request("search", post({ cp_min: 0 })), {}, fetcher, cache)).status, 200);
+    assert.equal(calls, before + 2);
+  }
+  assert.equal(cache.entries.entries.size, 0);
+  assert.equal(cache.pending.size, 0);
+});
+
+test("guest cache evicts old searches and never stores results past despawn", async () => {
+  const now = Date.now();
+  const cache = createSearchCache(() => now);
+  let calls = 0;
+  const upstream = async () => { calls++; return Response.json({ results: [] }); };
+  for (let cp_min = 0; cp_min < 9; cp_min++) await handleBridge(request("search", post({ cp_min })), {}, upstream, cache);
+  assert.equal(cache.entries.entries.size, 8);
+  await handleBridge(request("search", post({ cp_min: 0 })), {}, upstream, cache);
+  assert.equal(calls, 10);
+  const expired = async () => { calls++; return Response.json({ results: [{ pokemon_id: 25, encounter_id: "gone", despawn_at: new Date(now).toISOString() }] }); };
+  for (let i = 0; i < 2; i++) await handleBridge(request("search", post({ cp_min: 99 })), {}, expired, cache);
+  assert.equal(calls, 12);
+});
+
+test("large successful replies are returned in full without retaining them in the guest cache", async () => {
+  const cache = createSearchCache();
+  const body = { results: [{ pokemon_id: 25, encounter_id: "one", extra: "x".repeat(270000) }] };
+  let calls = 0;
+  for (let i = 0; i < 2; i++) {
+    const response = await handleBridge(request("search", post({ cp_min: 5 })), {}, async () => { calls++; return Response.json(body); }, cache);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), body);
+  }
+  assert.equal(calls, 2);
+  assert.equal(cache.entries.entries.size, 0);
+});
 
 test("only known origins, methods and fixed provider routes are allowed", async () => {
   let calls = 0;

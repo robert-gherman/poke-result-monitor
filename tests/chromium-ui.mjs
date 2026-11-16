@@ -13,6 +13,7 @@ const pending = new Map();
 const errors = [];
 let mode = "many";
 let searchCount = 0;
+let searchHeaders = [];
 let revealCount = 0;
 let lastPayload;
 let delayedRequest;
@@ -30,7 +31,7 @@ function send(method, params = {}) {
     ws.send(JSON.stringify({ id: requestId, method, params }));
   });
 }
-const fulfill = (requestId, body, responseCode = 200) => send("Fetch.fulfillRequest", { requestId, responseCode, responseHeaders: [{ name: "Content-Type", value: "application/json" }], body: Buffer.from(JSON.stringify(body)).toString("base64") });
+const fulfill = (requestId, body, responseCode = 200, headers = []) => send("Fetch.fulfillRequest", { requestId, responseCode, responseHeaders: [{ name: "Content-Type", value: "application/json" }, ...headers], body: Buffer.from(JSON.stringify(body)).toString("base64") });
 ws.addEventListener("message", async event => {
   const data = JSON.parse(event.data);
   if (data.id) {
@@ -58,7 +59,8 @@ ws.addEventListener("message", async event => {
         lastPayload = JSON.parse(request.postData);
         if (mode === "delay") { delayedRequest = requestId; return; }
         if (mode === "error") { await fulfill(requestId, { error: "Provider failed" }, 502); return; }
-        await fulfill(requestId, { results: mode === "zero" ? [] : mode === "one" ? results.slice(0, 1) : results, cap: 10, total_matches: 0 });
+        if (mode === "malformed") { await fulfill(requestId, { results: [null] }); return; }
+        await fulfill(requestId, { results: mode === "zero" ? [] : mode === "one" ? results.slice(0, 1) : results, cap: 10, total_matches: 0 }, 200, searchHeaders);
       } else if (route?.startsWith("reveal/")) {
         revealCount++;
         if (revealMode === "limit") { await fulfill(requestId, { error_code: "provider_rate_limited", retry_after: 8 }, 429); return; }
@@ -75,6 +77,7 @@ async function evaluate(expression, userGesture = false) {
   if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text);
   return result.result.value;
 }
+const advanceTime = ms => evaluate(`globalThis.fixtureOriginalNow ||= Date.now; globalThis.fixtureClockOffset=(globalThis.fixtureClockOffset||0)+${ms}; Date.now=()=>globalThis.fixtureOriginalNow()+globalThis.fixtureClockOffset`);
 async function until(expression) {
   const deadline = Date.now() + 10000;
   do { if (await evaluate(expression)) return; await new Promise(resolve => setTimeout(resolve, 50)); } while (Date.now() < deadline);
@@ -259,6 +262,24 @@ try {
   await click(".find-button");
   assert.equal(revealCount, 1);
   console.log("PASS: Find copies to the real Chromium clipboard; copy again does not re-reveal");
+  const beforeCachedSearch = searchCount;
+  const originalMeta = await evaluate('document.querySelector("#results-meta").textContent');
+  await evaluate('globalThis.fixtureCopies=0;globalThis.fixtureWrite=navigator.clipboard.writeText.bind(navigator.clipboard);navigator.clipboard.writeText=async text=>{globalThis.fixtureCopies++;return globalThis.fixtureWrite(text)}');
+  await click("#search-button");
+  await until('!document.querySelector("#search-button").disabled');
+  assert.equal(searchCount, beforeCachedSearch);
+  assert.equal(await evaluate('document.querySelector("#results-meta").textContent'), `${originalMeta} · cached`);
+  assert.equal(await evaluate('document.querySelector(".find-button").textContent'), "Copy again");
+  assert.equal(await evaluate('globalThis.fixtureCopies'), 0, "Search must not automatically copy cached coordinates");
+  await advanceTime(15001);
+  results[0].reveal_code = "replacement-code";
+  await click("#search-button");
+  await until('!document.querySelector("#search-button").disabled');
+  assert.equal(searchCount, beforeCachedSearch + 1);
+  await click(".find-button");
+  assert.equal(revealCount, 1, "A changed reveal code for the same encounter reuses coordinates");
+  assert.equal(await evaluate('globalThis.fixtureCopies'), 1);
+  console.log("PASS: identical searches stay local for 15s without changing fetched time or copying; expired searches fetch again and reuse encounter coordinates across code changes");
   revealMode = "limit";
   await click(".result-card:nth-child(2) .find-button");
   await until('!document.querySelector("#provider-notice").hidden');
@@ -274,17 +295,17 @@ try {
   await screenshot("provider-limit-mobile");
   await click("#search-button");
   await until('!document.querySelector("#search-button").disabled');
-  assert.equal(await evaluate('document.querySelectorAll(".find-button:disabled").length'), 23, "A new search must retain the shared reveal cooldown");
-  await until('!document.querySelector(".find-button").disabled');
+  assert.equal(await evaluate('document.querySelectorAll(".find-button:disabled").length'), 22, "A new search retains cooldown and cached coordinates");
+  await until('!document.querySelector(".result-card:nth-child(2) .find-button").disabled');
   assert.equal(revealCount, 2, "Cooldown expiry must not retry automatically");
   revealMode = "delay";
-  await click(".find-button");
-  await until('document.querySelector(".find-button").textContent === "Finding…"');
-  assert.equal(await evaluate('document.querySelectorAll(".find-button:disabled").length'), 23);
+  await click(".result-card:nth-child(2) .find-button");
+  await until('document.querySelector(".result-card:nth-child(2) .find-button").textContent === "Finding…"');
+  assert.equal(await evaluate('document.querySelectorAll(".find-button:disabled").length'), 22);
   await click(".result-card:nth-child(2) .find-button");
   assert.equal(revealCount, 3);
   await fulfill(delayedReveal, { coords: "44.4268, 26.1025" });
-  await until('document.querySelector(".find-button").textContent === "Copy again"');
+  await until('document.querySelector(".result-card:nth-child(2) .find-button").textContent === "Copy again"');
   assert.equal(await evaluate('document.querySelector("#provider-notice").hidden'), true);
   revealMode = "success";
   console.log("PASS: one shared cooldown survives a new search, preserves local copies, never auto-retries, and prevents simultaneous reveals");
@@ -355,6 +376,7 @@ try {
   await click("#copy-dialog [data-close]");
   console.log("PASS: denied clipboard permission shows manual coordinates");
   mode = "error";
+  await advanceTime(15001);
   await click("#search-button");
   await until("document.querySelector('#search-message').classList.contains('error')");
   assert.equal(await evaluate("document.querySelectorAll('.result-card').length"), 23);
@@ -371,10 +393,12 @@ try {
   assert.equal(lastPayload.center_lat, 0);
   console.log("PASS: PvP and coordinates include zero latitude, omit inactive stats, and remain responsive");
   mode = "zero";
+  await advanceTime(15001);
   await click("#search-button");
   await until("document.querySelector('#result-count').textContent==='0'");
   assert.match(await evaluate("document.querySelector('#results').textContent"), /No spawns/);
   mode = "delay";
+  await advanceTime(5001);
   await click("#search-button");
   while (!delayedRequest) await new Promise(resolve => setTimeout(resolve, 20));
   await click("button[type=reset]");
@@ -393,6 +417,53 @@ try {
     const screenshot = await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true });
     await writeFile(new URL(`../.test-artifacts/${name}.png`, import.meta.url), Buffer.from(screenshot.data, "base64"));
   }
+  for (const failure of ["error", "malformed"]) {
+    mode = failure;
+    await evaluate(`document.querySelector('[name=cp_min]').value=${JSON.stringify(failure === "error" ? "1" : "2")}`);
+    const before = searchCount;
+    for (let i = 0; i < 2; i++) {
+      await click("#search-button");
+      await until('!document.querySelector("#search-button").disabled && document.querySelector("#search-message").classList.contains("error")');
+      assert.equal(searchCount, before + i + 1);
+      assert.equal(await evaluate('document.querySelectorAll(".result-card").length'), 23);
+    }
+  }
+  mode = "many";
+  searchHeaders = [{ name: "X-Pokesearch-Cache", value: "hit" }, { name: "X-Pokesearch-Age-Ms", value: "14000" }, { name: "X-Pokesearch-TTL-Ms", value: "1000" }];
+  await evaluate('document.querySelector("[name=cp_min]").value="3"');
+  await click("#search-button");
+  await until('!document.querySelector("#search-button").disabled');
+  const beforeAgedHit = searchCount;
+  assert.match(await evaluate('document.querySelector("#results-meta").textContent'), /cached/);
+  await click("#search-button");
+  assert.equal(searchCount, beforeAgedHit);
+  await advanceTime(1001);
+  await click("#search-button");
+  await until('!document.querySelector("#search-button").disabled');
+  assert.equal(searchCount, beforeAgedHit + 1, "Aged bridge data must not start another 15-second browser lifetime");
+  searchHeaders = [];
+  console.log("PASS: failed/malformed searches are never cached; bridge cache age and remaining lifetime are respected");
+
+  await click("#connection-button");
+  await evaluate('document.querySelector("#api-endpoint").value="http://127.0.0.1:4173/api/bridge/"');
+  await click("#save-connection");
+  await until('!document.querySelector("#connection-dialog").open');
+  const beforeEndpointSearch = searchCount;
+  await click("#search-button");
+  await until('!document.querySelector("#search-button").disabled');
+  assert.equal(searchCount, beforeEndpointSearch + 1);
+  assert.equal(await evaluate('document.querySelector(".revealed-coords").hidden'), true);
+  await click(".find-button");
+  await until('document.querySelector("#copy-dialog").open');
+  await click("#copy-dialog [data-close]");
+  const beforeExpiryReveals = revealCount;
+  const millisecondsToDespawn = await evaluate(`Date.parse(${JSON.stringify(results[0].despawn_at)})-Date.now()+1`);
+  await advanceTime(millisecondsToDespawn);
+  await until('document.querySelector(".find-button").textContent==="Despawned"');
+  assert.equal(await evaluate('document.querySelector(".revealed-coords").hidden'), true);
+  await click(".find-button");
+  assert.equal(revealCount, beforeExpiryReveals);
+  console.log("PASS: changing endpoints clears both caches; despawn removes cached coordinates and prevents copying or revealing expired encounters");
   assert.deepEqual(errors, [], "No uncaught browser errors");
   console.log(`PASS: no uncaught browser exceptions; ${searchCount} fixture searches, ${revealCount} reveal; screenshots saved`);
 } finally { ws.close(); }
