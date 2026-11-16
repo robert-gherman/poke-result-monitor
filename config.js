@@ -1,3 +1,3 @@
 // Set this to your deployed Vercel /api/bridge URL or Cloudflare Worker URL.
 // Public configuration only. Never put account tokens or passwords here.
-window.POGO_CONFIG = { apiEndpoint: "" };
+window.POGO_CONFIG = { apiEndpoint: "https://poke-result-monitor.gherman-robert01.workers.dev" };
