@@ -16,6 +16,10 @@ let searchCount = 0;
 let revealCount = 0;
 let lastPayload;
 let delayedRequest;
+let revealMode = "success";
+let delayedReveal;
+let accountMode = "free";
+let lastAuthorization;
 const results = Array.from({ length: 23 }, (_, i) => ({ encounter_id: `fixture-${i}`, pokemon_id: 147, pokemon_name: i === 0 ? "Dratini with a particularly long form name" : "Dratini", cp: 745, level: 30, iv_percent: 100, raw_iv: "15/15/15", gender: "Female", size: "XXL", location: "Bucharest, Romania · a long location that should wrap on narrow phones", shiny: true, weather_boosted: true, despawn_at: new Date(Date.now() + 1200000).toISOString(), reveal_code: `fixture-${i}` }));
 
 function send(method, params = {}) {
@@ -43,6 +47,12 @@ ws.addEventListener("message", async event => {
         return;
       }
       const route = new URL(request.url).searchParams.get("route");
+      lastAuthorization = Object.entries(request.headers).find(([name]) => name.toLowerCase() === "authorization")?.[1];
+      if (route === "account") {
+        if (accountMode === "invalid") await fulfill(requestId, { error: "Provider request failed" }, 401);
+        else await fulfill(requestId, { authenticated: true, tier: "free" });
+        return;
+      }
       if (route === "search") {
         searchCount++;
         lastPayload = JSON.parse(request.postData);
@@ -51,6 +61,9 @@ ws.addEventListener("message", async event => {
         await fulfill(requestId, { results: mode === "zero" ? [] : mode === "one" ? results.slice(0, 1) : results, cap: 10, total_matches: 0 });
       } else if (route?.startsWith("reveal/")) {
         revealCount++;
+        if (revealMode === "limit") { await fulfill(requestId, { error_code: "provider_rate_limited", retry_after: 8 }, 429); return; }
+        if (revealMode === "auth") { await fulfill(requestId, { error: "Provider request failed" }, 401); return; }
+        if (revealMode === "delay") { delayedReveal = requestId; return; }
         await fulfill(requestId, { coords: "44.4268, 26.1025" });
       } else await send("Fetch.continueRequest", { requestId });
     } catch (error) { errors.push(error.message); }
@@ -101,6 +114,11 @@ async function noOverflow(label) {
   const layout = await evaluate(`({width:innerWidth,scroll:document.documentElement.scrollWidth,offenders:[...document.querySelectorAll('input,select,button,.range-inputs,.size-options')].filter(e=>e.getBoundingClientRect().width && !e.closest('dialog:not([open])') && (e.getBoundingClientRect().right>innerWidth+1 || e.getBoundingClientRect().left < -1)).map(e=>e.id||e.className)})`);
   assert.ok(layout.scroll <= layout.width + 1, `${label}: horizontal overflow ${JSON.stringify(layout)}`);
   assert.equal(layout.offenders.length, 0, `${label}: clipped controls ${JSON.stringify(layout)}`);
+}
+async function screenshot(name) {
+  await mkdir(new URL("../.test-artifacts/", import.meta.url), { recursive: true });
+  const capture = await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true });
+  await writeFile(new URL(`../.test-artifacts/${name}.png`, import.meta.url), Buffer.from(capture.data, "base64"));
 }
 
 try {
@@ -241,6 +259,94 @@ try {
   await click(".find-button");
   assert.equal(revealCount, 1);
   console.log("PASS: Find copies to the real Chromium clipboard; copy again does not re-reveal");
+  revealMode = "limit";
+  await click(".result-card:nth-child(2) .find-button");
+  await until('!document.querySelector("#provider-notice").hidden');
+  assert.equal(revealCount, 2);
+  assert.match(await evaluate('document.querySelector("#provider-guidance").textContent'), /Guest.*Cloudflare.*account/);
+  assert.equal(await evaluate('document.querySelectorAll(".find-button:disabled").length'), 22);
+  await click(".result-card:nth-child(3) .find-button");
+  await click(".find-button");
+  assert.equal(revealCount, 2, "Cooldown blocks other results but copying revealed coordinates remains local");
+  for (const width of [320, 390, 768, 1280]) { await viewport(width); await noOverflow(`provider limit ${width}`); }
+  await viewport(320);
+  await evaluate('document.querySelector("#provider-notice").scrollIntoView({block:"start"})');
+  await screenshot("provider-limit-mobile");
+  await click("#search-button");
+  await until('!document.querySelector("#search-button").disabled');
+  assert.equal(await evaluate('document.querySelectorAll(".find-button:disabled").length'), 23, "A new search must retain the shared reveal cooldown");
+  await until('!document.querySelector(".find-button").disabled');
+  assert.equal(revealCount, 2, "Cooldown expiry must not retry automatically");
+  revealMode = "delay";
+  await click(".find-button");
+  await until('document.querySelector(".find-button").textContent === "Finding…"');
+  assert.equal(await evaluate('document.querySelectorAll(".find-button:disabled").length'), 23);
+  await click(".result-card:nth-child(2) .find-button");
+  assert.equal(revealCount, 3);
+  await fulfill(delayedReveal, { coords: "44.4268, 26.1025" });
+  await until('document.querySelector(".find-button").textContent === "Copy again"');
+  assert.equal(await evaluate('document.querySelector("#provider-notice").hidden'), true);
+  revealMode = "success";
+  console.log("PASS: one shared cooldown survives a new search, preserves local copies, never auto-retries, and prevents simultaneous reveals");
+  await click("#connection-button");
+  await click(".account-help summary");
+  for (const width of [320, 390, 768]) { await viewport(width); await noOverflow(`account connection ${width}`); }
+  await viewport(320);
+  await screenshot("provider-account-mobile");
+  await evaluate('document.querySelector("#api-token").value="invalid-fixture-token"');
+  accountMode = "invalid";
+  await click("#save-connection");
+  await until('document.querySelector("#connection-error").textContent.includes("rejected")');
+  assert.equal(await evaluate('document.querySelector("#connection-dialog").open'), true);
+  assert.equal(await evaluate('document.querySelectorAll(".result-card").length'), 23);
+  accountMode = "free";
+  await evaluate('document.querySelector("#api-token").value="Bearer fixture-own-token"');
+  await click("#save-connection");
+  await until('!document.querySelector("#connection-dialog").open');
+  assert.equal(lastAuthorization, "Bearer fixture-own-token");
+  assert.equal(await evaluate('document.querySelector("#api-token").value'), "");
+  assert.equal(await evaluate('JSON.stringify(localStorage).includes("fixture-own-token") || JSON.stringify(sessionStorage).includes("fixture-own-token")'), false);
+  assert.equal(await evaluate('document.querySelectorAll(".result-card").length'), 0, "New account requires a fresh search");
+  await click("#search-button");
+  await until('document.querySelectorAll(".result-card").length===23');
+  assert.equal(lastAuthorization, "Bearer fixture-own-token");
+  await click(".find-button");
+  await until('document.querySelector(".find-button").textContent === "Copy again"');
+  assert.equal(lastAuthorization, "Bearer fixture-own-token");
+  revealMode = "auth";
+  await click(".result-card:nth-child(2) .find-button");
+  await until('document.querySelector("#provider-status").textContent === "Provider access rejected"');
+  assert.equal(await evaluate('document.querySelectorAll(".find-button:disabled").length'), 22);
+  await click("#provider-connect");
+  assert.match(await evaluate('document.querySelector("#provider-account-state").textContent'), /needs verification/);
+  await click("#save-connection");
+  await until('!document.querySelector("#connection-dialog").open');
+  assert.equal(await evaluate('document.querySelectorAll(".result-card").length'), 0);
+  revealMode = "success";
+  await click("#search-button");
+  await until('document.querySelectorAll(".result-card").length===23');
+  await click(".find-button");
+  await until('document.querySelector(".find-button").textContent === "Copy again"');
+  console.log("PASS: invalid account verification preserves results; verified visitor tokens reach search/reveal without storage; expired-token recovery requires fresh results");
+  revealMode = "delay";
+  delayedReveal = null;
+  await click(".result-card:nth-child(2) .find-button");
+  await until('document.querySelector(".result-card:nth-child(2) .find-button").textContent === "Finding…"');
+  assert.ok(delayedReveal);
+  await click("#connection-button");
+  await evaluate('document.querySelector("#api-token").value="fixture-next-token"');
+  await click("#save-connection");
+  await until('!document.querySelector("#connection-dialog").open');
+  try { await fulfill(delayedReveal, { coords: "1, 2" }); } catch { /* The cancelled interception may already have been removed by Chromium. */ }
+  assert.equal(await evaluate('document.querySelectorAll(".revealed-coords").length'), 0);
+  assert.match(await evaluate('document.querySelector("#toast").textContent'), /account verified/);
+  revealMode = "success";
+  await click("#search-button");
+  await until('document.querySelectorAll(".result-card").length===23');
+  assert.equal(lastAuthorization, "Bearer fixture-next-token");
+  await click(".find-button");
+  await until('document.querySelector(".find-button").textContent === "Copy again"');
+  console.log("PASS: changing accounts cancels an outstanding reveal; its late response cannot display or copy old-account coordinates");
   await evaluate("navigator.clipboard.writeText=async()=>{throw new Error('Permission denied')} ");
   await click(".find-button");
   await until("document.querySelector('#copy-dialog').open");

@@ -9,8 +9,8 @@ A mobile-first Pokémon GO search page for Robert Gherman's GitHub Pages site. P
 - Save named Pokémon lists as browser presets, then load, update or delete them. Presets retain species/forms and include/exclude mode while leaving other search filters unchanged. Up to 50 presets with 60-character names are supported. They stay on the current browser/device; clearing browser storage removes them.
 - Shiny and background flags, location text or coordinates/radius, IV percentage/raw IV, CP, level, PvP, size, weather, form, gender, minimum time left, trainer ID and sorting.
 - Every item in the API's `results` array is shown in one list. No ten-item pagination, extra pages, automatic searches, polling, or hidden retries. Provider account caps still apply; the UI cannot return results the provider omitted.
-- **Find** reveals coordinates and immediately attempts to copy them. Revealed coordinates are reused when copying again; clipboard failures show selectable coordinates. Expired encounters and reveal limits have explicit states.
-- Tokens are optional (anonymous provider access is supported), stay in memory for the current tab, and are never built into assets, persisted, logged, or read from the monitor's private files.
+- **Find** reveals coordinates and immediately attempts to copy them. Revealed coordinates are reused when copying again; clipboard failures show selectable coordinates. Reveals run one at a time. A provider 429 pauses every unrevealed result for the supplied cooldown, including results from a new search, with no automatic retries. Previously revealed coordinates can still be copied.
+- Guest searches may work while guest reveals are blocked, especially through a shared serverless connection. Connection settings can verify your own provider token before using it. Tokens stay in memory for the current tab and are never built into assets, persisted, logged, or read from the monitor's private files. Changing connections clears old encounters and cancels pending requests so a fresh search uses the current account.
 
 ## Local development
 
@@ -20,7 +20,7 @@ Use Node.js 22 or newer:
 npm run dev
 ```
 
-Open http://127.0.0.1:4173 in standalone Chromium. The local server serves only [site](./site/) and the API bridge; parent monitor credentials are never served. Search requests reach the real provider only when you click Search. Find consumes a provider reveal request. The public configuration uses the deployed Cloudflare Worker; to test the local bridge, set the connection URL to `http://127.0.0.1:4173/api/bridge`.
+Open http://127.0.0.1:4173 in standalone Chromium. The local server serves only [site](./site/) and the API bridge; parent monitor credentials are never served. Search requests reach the real provider only when you click Search. Find consumes a provider reveal request. On localhost, the page defaults to its local bridge; the published site defaults to the deployed Cloudflare Worker. A URL saved in connection settings overrides either default.
 
 ```sh
 npm test
@@ -63,7 +63,21 @@ Deploy [server/worker.mjs](./server/worker.mjs) using [wrangler.toml](./wrangler
 
 The ongoing [Workers Free plan](https://developers.cloudflare.com/workers/platform/pricing/) currently permits 100,000 requests per account/day, resetting at midnight UTC, with 10 ms of CPU time per invocation. Network waiting does not count as CPU time. Requests fail when the free daily quota is exhausted; paid usage requires a paid plan. Searches, reveals and CORS preflights count toward Worker usage. Typing suggestions and saving/loading presets run locally and do not call the Worker. Provider result/reveal limits apply separately.
 
-The bridge allows only `POST search`, `GET reveal/<code>`, and its own `GET health`; it never accepts arbitrary upstream URLs, refreshes authentication, changes account tiers, or retries calls. Authentication and provider limits remain enforced upstream. A serverless bridge shares provider-visible outbound IPs, so anonymous rate limits may be shared among visitors.
+The bridge allows only `POST search`, `GET reveal/<code>`, authenticated `GET account` (a sanitized check of the provider's `/users/me` route), and its own `GET health`. Account verification returns only whether the token was accepted and the free/VIP tier; profile and trainer data are discarded. The bridge never accepts arbitrary upstream URLs, refreshes authentication, changes account tiers, or retries calls. Authentication and provider limits remain enforced upstream. A serverless bridge shares provider-visible outbound IPs, so anonymous rate limits may be shared among visitors.
+
+## Resolving provider reveal limits
+
+HTTP 429 from the provider is separate from Cloudflare's free hosting quota. A guest may receive it on their first reveal through Cloudflare even when searches succeed. A diagnostic on 16 November 2026 returned coordinates through a direct connection from the development computer, while one search/reveal through the deployed Cloudflare Worker returned 429 with `retry_after: 179`. This isolates the observed failure to the Cloudflare request path, but does not establish how the provider counts or groups IPs. Repeating requests or waiting one cooldown did not establish reliable guest access through that path.
+
+The original provider UI offers account login after a guest reveal limit. To use your own account here:
+
+1. Sign in at https://pogocoordinates.com/search.
+2. On desktop Chromium, open DevTools → Application → Local storage → `https://pogocoordinates.com` and copy your own `jwt` value. Never share it in chat or commit it.
+3. Open this page's connection settings, retain your own bridge URL, paste the token, and save. The bridge verifies it without returning private profile data. Search again to obtain fresh encounters. Provider account limits still apply; successful account verification does not guarantee reveal availability.
+
+Tokens are cleared on reload/closing the tab. A login on the provider's domain does not transfer automatically to GitHub Pages; this project is not registered as a provider OAuth application. The mobile alternative is to sign in and reveal directly on the provider's website, linked from the limit notice.
+
+For personal use from a computer, the existing local server is also a direct connection option: run `npm run dev` and open http://127.0.0.1:4173. The local page defaults to `http://127.0.0.1:4173/api/bridge`; if you previously saved a different connection URL, update it in settings. It uses that computer's connection and still respects the provider's guest/account limits. It only listens on loopback and is available while running; this is not an always-on public backend. No IP rotation, forwarding-header spoofing, or shared credentials are implemented. Reliable public access may require provider-approved API access or a backend you control with suitable provider limits.
 
 ## Manual standalone Chromium checks
 

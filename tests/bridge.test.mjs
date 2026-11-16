@@ -67,6 +67,51 @@ test("anonymous reveal forwards no shared account token", async () => {
   assert.equal((await response.json()).coords, "44.4268, 26.1025");
 });
 
+test("account verification requires the visitor's token and only exposes the verified tier", async () => {
+  let calls = 0;
+  const upstream = async (url, options) => {
+    calls++;
+    assert.equal(url, "https://coordinates-api.pokemongopro.com/users/me");
+    assert.equal(options.headers.Authorization, "Bearer visitor-token");
+    assert.equal(options.method, "GET");
+    return Response.json({ id: "private-id", email: "private@example.com", trainers: ["private-trainer"], is_vip: false });
+  };
+  assert.equal((await handleBridge(request("account"), {}, upstream)).status, 401);
+  assert.equal((await handleBridge(request("account", post({ cp_min: 0 })), {}, upstream)).status, 405);
+  assert.equal(calls, 0);
+  const response = await handleBridge(request("account", { headers: { Origin: origin, Authorization: "Bearer visitor-token" } }), {}, upstream);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { authenticated: true, tier: "free" });
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(calls, 1);
+  const invalid = await handleBridge(request("account", { headers: { Authorization: "Bearer visitor-token" } }), {}, async () => Response.json({ unexpected: "private" }));
+  assert.equal(invalid.status, 502);
+});
+
+test("reveal uses the verified visitor token without changing the route or retrying", async () => {
+  let calls = 0;
+  const response = await handleBridge(request("reveal/account-code", { headers: { Origin: origin, Authorization: "Bearer own-account" } }), {}, async (url, options) => {
+    calls++;
+    assert.equal(url, "https://coordinates-api.pokemongopro.com/reveal/account-code");
+    assert.equal(options.headers.Authorization, "Bearer own-account");
+    return Response.json({ detail: { retry_after: 180, message: "private diagnostics" } }, { status: 429 });
+  });
+  assert.equal(calls, 1);
+  assert.equal(response.status, 429);
+  assert.deepEqual(await response.json(), { error: "Provider rate limit reached.", error_code: "provider_rate_limited", retry_after: 180 });
+});
+
+test("provider cooldowns accept seconds or an HTTP date and reject unsafe values", async () => {
+  for (const [header, detail, expected] of [["25", {}, 25], [null, { retry_after: 179.1 }, 180], ["-1", { retry_after: 7 }, 7], [null, { retry_after: true }, undefined], [null, { retry_after: -3 }, undefined], [null, { retry_after: 999999 }, 86400]]) {
+    const response = await handleBridge(request("reveal/code"), {}, async () => Response.json({ detail }, { status: 429, headers: header ? { "Retry-After": header } : {} }));
+    assert.equal((await response.json()).retry_after, expected);
+  }
+  const future = new Date(Date.now() + 120000).toUTCString();
+  const response = await handleBridge(request("reveal/code"), {}, async () => new Response("not JSON", { status: 429, headers: { "Retry-After": future } }));
+  const seconds = (await response.json()).retry_after;
+  assert.ok(seconds >= 118 && seconds <= 120);
+});
+
 test("provider failures remain failures and sensitive upstream details are suppressed", async () => {
   for (const status of [401, 403, 404, 410, 429, 500]) {
     const response = await handleBridge(request("reveal/test-code"), {}, async () => Response.json({ detail: { secret: "private", retry_after: 12 } }, { status }));

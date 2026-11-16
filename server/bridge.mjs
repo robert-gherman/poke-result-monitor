@@ -7,6 +7,11 @@ function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", ...headers } });
 }
 
+function retrySeconds(header, detail) {
+  const seconds = value => (typeof value === "number" || (typeof value === "string" && /^\d+(\.\d+)?$/.test(value.trim()))) && Number.isFinite(Number(value)) && Number(value) > 0 ? Math.min(86400, Math.ceil(Number(value))) : null;
+  return seconds(header) || (header && Number.isFinite(Date.parse(header)) ? seconds((Date.parse(header) - Date.now()) / 1000) : null) || seconds(detail?.retry_after);
+}
+
 async function boundedBody(response, limit) {
   if (Number(response.headers.get("content-length")) > limit) throw new RangeError("Response too large");
   const reader = response.body?.getReader();
@@ -39,10 +44,12 @@ export async function handleBridge(request, env = {}, fetchUpstream = fetch) {
   let revealCode = "";
   try { if (route?.startsWith("reveal/")) revealCode = decodeURIComponent(route.slice(7)); } catch { /* Invalid escaping is rejected below. */ }
   const reveal = /^[a-zA-Z0-9._~-]{1,2048}={0,2}$/.test(revealCode);
-  if (route !== "search" && !reveal) return json({ error: "Unknown route." }, 404, cors);
-  if ((route === "search" && request.method !== "POST") || (reveal && request.method !== "GET")) return json({ error: "Method not allowed." }, 405, { ...cors, Allow: reveal ? "GET" : "POST" });
+  const account = route === "account";
+  if (route !== "search" && !reveal && !account) return json({ error: "Unknown route." }, 404, cors);
+  if ((route === "search" && request.method !== "POST") || ((reveal || account) && request.method !== "GET")) return json({ error: "Method not allowed." }, 405, { ...cors, Allow: route === "search" ? "POST" : "GET" });
   const authorization = request.headers.get("authorization");
   if (authorization && !/^Bearer [^\s]{1,8192}$/.test(authorization)) return json({ error: "Invalid authorization header." }, 400, cors);
+  if (account && !authorization) return json({ error: "Enter your provider access token to verify your account." }, 401, cors);
   let body;
   if (route === "search") {
     if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return json({ error: "Expected JSON." }, 415, cors);
@@ -58,20 +65,23 @@ export async function handleBridge(request, env = {}, fetchUpstream = fetch) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 20000);
   try {
-    const upstreamPath = reveal ? `reveal/${encodeURIComponent(revealCode)}` : "search";
+    const upstreamPath = account ? "users/me" : reveal ? `reveal/${encodeURIComponent(revealCode)}` : "search";
     // Workers supports manual redirects only; reject 3xx below without following them.
     const response = await fetchUpstream(`${UPSTREAM}/${upstreamPath}`, { method: request.method, headers, body, signal: controller.signal, redirect: "manual" });
     if (!response.ok) {
       const status = [400, 401, 403, 404, 410, 422, 429].includes(response.status) ? response.status : 502;
-      let retryAfter = Number(response.headers.get("retry-after")) || null;
-      if (status === 429 && !retryAfter) {
-        try { const data = JSON.parse(await boundedBody(response, 8192)); retryAfter = Number(data.detail?.retry_after) || null; } catch { /* Retry guidance is optional. */ }
+      let detail;
+      if (status === 429) {
+        try { detail = JSON.parse(await boundedBody(response, 8192))?.detail; } catch { /* Retry guidance is optional. */ }
       }
-      return json({ error: status === 429 ? "Provider rate limit reached." : "Provider request failed.", ...(retryAfter && Number.isFinite(retryAfter) && retryAfter > 0 ? { retry_after: Math.min(retryAfter, 86400) } : {}) }, status, cors);
+      const retryAfter = status === 429 ? retrySeconds(response.headers.get("retry-after"), detail) : null;
+      return json({ error: status === 429 ? "Provider rate limit reached." : "Provider request failed.", ...(status === 429 ? { error_code: "provider_rate_limited" } : {}), ...(retryAfter ? { retry_after: retryAfter } : {}) }, status, cors);
     }
     let data;
     try { data = JSON.parse(await boundedBody(response, MAX_RESPONSE_BYTES)); }
     catch { return json({ error: "Invalid provider response." }, 502, cors); }
+    // Account verification returns no profile, trainer information or credentials.
+    if (account) return typeof data?.is_vip === "boolean" ? json({ authenticated: true, tier: data.is_vip ? "vip" : "free" }, 200, cors) : json({ error: "Incomplete provider response." }, 502, cors);
     if (route === "search" ? !Array.isArray(data?.results) : typeof data?.coords !== "string") return json({ error: "Incomplete provider response." }, 502, cors);
     return json(data, 200, cors);
   } catch { return json({ error: controller.signal.aborted ? "Provider request timed out." : "Provider connection failed." }, controller.signal.aborted ? 504 : 502, cors); }
