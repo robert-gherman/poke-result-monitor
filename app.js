@@ -2,6 +2,8 @@ import { buildSearchPayload, parseSearchResponse, parseCoordinates, remainingTim
 import { POKEMON_PRESETS_KEY, MAX_PRESETS, MAX_PRESET_NAME, matchPokemonOptions, parsePokemonPresets, serializePokemonPresets } from "./pokemon-lists.mjs";
 import { ExpiringCache, searchKey, searchExpiry, encounterKey, coordinateExpiry, SEARCH_TTL } from "./cache.mjs";
 import { normalizeSearchPreset } from "./search-presets.mjs";
+import { CONNECTION_KEY, parseSavedConnection, serializeConnection } from "./connection-storage.mjs";
+import { RememberedCoordinates } from "./coordinate-storage.mjs";
 
 const $ = selector => document.querySelector(selector);
 const form = $("#search-form");
@@ -9,15 +11,23 @@ const state = { pokemonMode: "include", formMode: "include", pokemonIds: [], spe
 const pokemonLists = { presets: [], available: true, catalogReady: false, suggestions: [], active: -1 };
 const revealAccess = { retryAt: 0, busy: false, issue: "", generation: 0, controller: null };
 const searches = new ExpiringCache(8);
-const coordinates = new ExpiringCache(500);
+const coordinates = new RememberedCoordinates();
 let accountTier = "";
 let toastTimer;
 let endpoint = "";
+let savedConnection = null;
+let connectionId = crypto.randomUUID();
 // Local development/personal use takes the computer's direct bridge by default.
 let configuredEndpoint = ["localhost", "127.0.0.1"].includes(location.hostname) ? new URL("./api/bridge", location.href).href : window.POGO_CONFIG?.apiEndpoint || "";
-try { configuredEndpoint = localStorage.getItem("pogo-api-endpoint") || configuredEndpoint; } catch { /* Use public configuration when browser storage is blocked. */ }
+try {
+  savedConnection = parseSavedConnection(localStorage.getItem(CONNECTION_KEY));
+  configuredEndpoint = savedConnection?.endpoint || localStorage.getItem("pogo-api-endpoint") || configuredEndpoint;
+} catch { /* Use public configuration when browser storage is blocked. */ }
 try { endpoint = normalizeEndpoint(configuredEndpoint, location.href); } catch { /* Invalid saved URL: use the connection dialog. */ }
 if (!endpoint && !location.hostname.endsWith("github.io")) endpoint = new URL("./api/bridge", location.href).href;
+if (savedConnection?.endpoint === endpoint) { state.token = savedConnection.token; connectionId = savedConnection.id; }
+savedConnection = null;
+coordinates.connect(endpoint, state.token ? connectionId : "guest");
 
 function node(tag, className = "", text = "") {
   const element = document.createElement(tag);
@@ -315,7 +325,7 @@ async function copyCoordinates(coords) {
   try {
     if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
     await navigator.clipboard.writeText(coords);
-    toast("Coordinates copied. Happy hunting!");
+    toast(coordinates.storageAvailable ? "Coordinates copied. Happy hunting!" : "Coordinates copied. Browser storage is unavailable; remembered for this tab only.");
     return true;
   } catch {
     $("#manual-coords").value = coords;
@@ -370,6 +380,7 @@ function createResult(result) {
     countdown.classList.toggle("urgent", time.urgent);
     const waiting = !coords && Math.max(0, Math.ceil((revealAccess.retryAt - Date.now()) / 1000));
     find.disabled = busy || time.expired || (!coords && (revealAccess.busy || revealAccess.issue === "auth" || waiting > 0 || !result.reveal_code));
+    find.setAttribute("aria-label", coords ? `Copy coordinates for ${text(result.pokemon_name, "Pokémon")}` : `Find ${text(result.pokemon_name, "Pokémon")} and copy coordinates`);
     if (!busy) find.textContent = time.expired ? "Despawned" : coords ? "Copy again" : waiting ? `Retry in ${waiting}s` : revealAccess.issue === "auth" ? "Check account" : !result.reveal_code ? "Unavailable" : revealAccess.busy ? "Please wait…" : "⌖ Find";
   };
   find.addEventListener("click", async () => {
@@ -644,13 +655,14 @@ function openConnection() {
   $("#api-endpoint").value = endpoint;
   $("#api-token").value = state.token;
   $("#connection-error").textContent = "";
-  $("#provider-account-state").textContent = state.token ? accountTier ? `Verified provider account (${accountTier === "vip" ? "VIP" : "free"}) for this tab. Provider limits still apply.` : "Your provider token needs verification. Save to check it, or replace it with a fresh token." : "Guest access. The shared Cloudflare connection may be limited even before your first reveal.";
+  $("#provider-account-state").textContent = state.token ? revealAccess.issue === "auth" ? "Your provider token needs verification. Save to check it, or replace it with a fresh token." : accountTier ? `Verified provider account (${accountTier === "vip" ? "VIP" : "free"}). Saved in this browser for your next visit. Provider limits still apply.` : "Saved provider token restored. You can search with your account; the provider checks access on each request. Provider limits still apply." : "Guest access. The shared Cloudflare connection may be limited even before your first reveal.";
   $("#connection-dialog").showModal();
 }
 
 function connectionChanged() {
   searches.clear();
   coordinates.clear();
+  coordinates.connect(endpoint, state.token ? connectionId : "guest", false);
   activeSearch?.abort();
   state.generation++;
   state.busy = false;
@@ -704,16 +716,18 @@ $("#connection-form").addEventListener("submit", async event => {
     }
     if (controller.signal.aborted || !$("#connection-dialog").open) return;
     const changed = endpoint !== nextEndpoint || state.token !== token;
+    const nextConnectionId = changed ? crypto.randomUUID() : connectionId;
+    try { localStorage.setItem(CONNECTION_KEY, serializeConnection(nextEndpoint, token, nextConnectionId)); }
+    catch { throw new SearchError("This connection could not be saved. Browser storage may be full or blocked. Allow site storage and save again; your current connection has been kept."); }
     endpoint = nextEndpoint;
     state.token = token;
+    connectionId = nextConnectionId;
     accountTier = tier;
     if (changed || (token && revealAccess.issue === "auth")) connectionChanged();
-    let saved = true;
-    try { localStorage.setItem("pogo-api-endpoint", endpoint); } catch { saved = false; }
     $("#connection-dialog").close();
     $("#api-token").value = "";
     $("#connection-notice").hidden = true;
-    toast(token ? "Provider account verified for this tab. Search again to use it." : saved ? "Guest connection saved. Provider limits still apply." : "Guest connection ready for this tab. Browser storage is unavailable.");
+    toast(token ? "Provider account verified and saved in this browser. Search again to use it." : "Guest connection saved. Provider limits still apply.");
   } catch (error) {
     if (!controller.signal.aborted) $("#connection-error").textContent = error instanceof SearchError ? error.message : "Could not save this connection. Try again.";
   } finally {
@@ -728,12 +742,36 @@ $("#clear-connection").addEventListener("click", () => {
   state.token = ""; endpoint = "";
   accountTier = "";
   connectionChanged();
-  try { localStorage.removeItem("pogo-api-endpoint"); } catch { /* Storage may be disabled. */ }
+  let removed = true;
+  for (const key of [CONNECTION_KEY, "pogo-api-endpoint"]) {
+    try { localStorage.removeItem(key); } catch { removed = false; }
+  }
   $("#api-endpoint").value = "";
   $("#api-token").value = "";
   $("#connection-notice").hidden = false;
+  if (!removed) {
+    $("#provider-account-state").textContent = "Disconnected for this tab.";
+    $("#connection-error").textContent = "Could not remove the saved connection because browser storage is blocked. Allow site storage and tap Disconnect again, or clear this site's data in your browser settings.";
+    return;
+  }
   $("#connection-dialog").close();
-  toast("Disconnected. Token cleared.");
+  toast("Disconnected. Saved token removed from this browser.");
+});
+window.addEventListener("storage", event => {
+  if (event.key !== CONNECTION_KEY && event.key !== null) return;
+  const connection = parseSavedConnection(event.newValue);
+  const nextEndpoint = connection?.endpoint || endpoint;
+  const token = connection?.token || "";
+  if (endpoint === nextEndpoint && state.token === token && (!token || connectionId === connection?.id)) return;
+  connectionCheck?.abort();
+  endpoint = nextEndpoint;
+  state.token = token;
+  connectionId = connection?.id || crypto.randomUUID();
+  accountTier = "";
+  connectionChanged();
+  $("#connection-dialog").close();
+  $("#connection-notice").hidden = Boolean(endpoint);
+  toast("Saved connection changed in another tab. Search again to use the current account.");
 });
 $("#manual-copy").addEventListener("click", async () => { if (await copyCoordinates($("#manual-coords").value)) $("#copy-dialog").close(); });
 $("#connection-notice").hidden = Boolean(endpoint);
