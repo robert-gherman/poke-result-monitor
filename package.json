@@ -7,6 +7,6 @@
   "scripts": {
     "dev": "node server/dev.mjs",
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check site/app.js && node --check site/search-core.mjs && node --check site/pokemon-lists.mjs && node --check site/search-presets.mjs && node --check site/cache.mjs && node --check server/bridge.mjs && node --check api/bridge.mjs"
+    "check": "node --check site/app.js && node --check site/connection-storage.mjs && node --check site/coordinate-storage.mjs && node --check site/search-core.mjs && node --check site/pokemon-lists.mjs && node --check site/search-presets.mjs && node --check site/cache.mjs && node --check server/bridge.mjs && node --check api/bridge.mjs"
   }
 }
