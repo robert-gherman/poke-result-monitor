@@ -77,7 +77,7 @@ export function parseSearchResponse(data) {
     throw new SearchError("The provider returned an incomplete result. Try the search again.");
   }
   // total_matches may be zero despite nonempty results. Never paginate or slice this array.
-  return { results: data.results, cap: Number.isInteger(data.cap) && data.cap > 0 ? data.cap : null };
+  return { results: data.results };
 }
 
 export function parseCoordinates(data) {
