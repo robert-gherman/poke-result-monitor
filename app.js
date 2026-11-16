@@ -1,11 +1,14 @@
 import { buildSearchPayload, parseSearchResponse, parseCoordinates, remainingTime, normalizeEndpoint, SearchError } from "./search-core.mjs";
 import { POKEMON_PRESETS_KEY, MAX_PRESETS, MAX_PRESET_NAME, matchPokemonOptions, parsePokemonPresets, serializePokemonPresets } from "./pokemon-lists.mjs";
+import { ExpiringCache, searchKey, searchExpiry, encounterKey, coordinateExpiry, SEARCH_TTL } from "./cache.mjs";
 
 const $ = selector => document.querySelector(selector);
 const form = $("#search-form");
 const state = { pokemonMode: "include", formMode: "include", pokemonIds: [], speciesForms: [], forms: [], locationMode: "area", pvp: false, catalog: [], formCatalog: [], options: [], picker: "pokemon", token: "", busy: false, generation: 0, cards: [] };
 const pokemonLists = { presets: [], available: true, catalogReady: false, suggestions: [], active: -1 };
 const revealAccess = { retryAt: 0, busy: false, issue: "", generation: 0, controller: null };
+const searches = new ExpiringCache(8);
+const coordinates = new ExpiringCache(500);
 let accountTier = "";
 let toastTimer;
 let endpoint = "";
@@ -55,6 +58,7 @@ function updateGroups() {
 }
 
 async function requestApi(route, payload, signal, connection = { endpoint, token: state.token }) {
+  const startedAt = Date.now();
   if (!connection.endpoint) throw new SearchError("Connect your API server using the settings button to start searching.");
   const url = new URL(connection.endpoint);
   url.searchParams.set("route", route);
@@ -77,7 +81,12 @@ async function requestApi(route, payload, signal, connection = { endpoint, token
       error.retryAfter = retryAfter;
       throw error;
     }
-    return data;
+    const remaining = Number(response.headers.get("X-Pokesearch-TTL-Ms"));
+    const age = Number(response.headers.get("X-Pokesearch-Age-Ms"));
+    const hasTiming = response.headers.has("X-Pokesearch-TTL-Ms") && Number.isFinite(remaining) && remaining >= 0;
+    return { data, fetchedAt: hasTiming && Number.isFinite(age) && age >= 0 ? startedAt - age : startedAt,
+      expiresAt: startedAt + (hasTiming ? Math.min(SEARCH_TTL, remaining) : SEARCH_TTL),
+      cached: response.headers.get("X-Pokesearch-Cache") === "hit" };
   } catch (error) {
     if (error instanceof SearchError) throw error;
     if (signal?.aborted) throw new DOMException("Cancelled", "AbortError");
@@ -341,14 +350,18 @@ function createResult(result) {
   const find = node("button", "primary-button find-button", "⌖ Find");
   find.type = "button";
   find.setAttribute("aria-label", `Find ${text(result.pokemon_name, "Pokémon")} and copy coordinates`);
-  let coords = "";
+  const cachedCoordinates = coordinates.get(encounterKey(result));
+  let coords = cachedCoordinates?.coords || "";
+  let coordsExpireAt = cachedCoordinates ? Math.min(cachedCoordinates.expiresAt, coordinateExpiry(result)) : 0;
   let busy = false;
   const errorBox = node("div", "card-error");
   errorBox.setAttribute("role", "status");
   errorBox.hidden = true;
   const coordBox = node("div", "revealed-coords");
-  coordBox.hidden = true;
+  coordBox.hidden = !coords;
+  coordBox.textContent = coords;
   const tick = () => {
+    if (coords && coordsExpireAt <= Date.now()) { coords = ""; coordBox.textContent = ""; coordBox.hidden = true; }
     const time = remainingTime(result.despawn_at);
     card.classList.toggle("is-expired", time.expired);
     countdown.textContent = `${time.expired ? "" : "◷ "}${time.text}${result.despawn_verified === false ? " · estimated" : ""}`;
@@ -358,6 +371,7 @@ function createResult(result) {
     if (!busy) find.textContent = time.expired ? "Despawned" : coords ? "Copy again" : waiting ? `Retry in ${waiting}s` : revealAccess.issue === "auth" ? "Check account" : !result.reveal_code ? "Unavailable" : revealAccess.busy ? "Please wait…" : "⌖ Find";
   };
   find.addEventListener("click", async () => {
+    tick();
     if (find.disabled || busy) return;
     if (coords) { await copyCoordinates(coords); return; }
     // Serialize reveals so another card cannot spend quota while one is pending.
@@ -372,9 +386,12 @@ function createResult(result) {
     errorBox.hidden = true;
     updateRevealAccess();
     try {
-      const data = await requestApi(`reveal/${encodeURIComponent(result.reveal_code)}`, undefined, controller.signal);
+      const { data } = await requestApi(`reveal/${encodeURIComponent(result.reveal_code)}`, undefined, controller.signal);
       if (generation !== revealAccess.generation) return;
       coords = parseCoordinates(data);
+      coordsExpireAt = coordinateExpiry(result);
+      if (coordsExpireAt <= Date.now()) { coords = ""; throw new SearchError("This encounter has despawned. Search again for current results."); }
+      coordinates.set(encounterKey(result), { coords, expiresAt: coordsExpireAt }, coordsExpireAt);
       revealAccess.issue = "";
       coordBox.textContent = coords;
       coordBox.hidden = false;
@@ -398,11 +415,11 @@ function createResult(result) {
   return card;
 }
 
-function renderResults(data) {
+function renderResults(data, fetchedAt, cached) {
   state.cards = [];
   $("#result-count").textContent = data.results.length;
-  const timestamp = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(new Date());
-  $("#results-meta").textContent = `${data.results.length} returned · updated ${timestamp}`;
+  const timestamp = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(fetchedAt));
+  $("#results-meta").textContent = `${data.results.length} returned · fetched ${timestamp}${cached ? " · cached" : ""}`;
   if (!data.results.length) {
     const empty = node("div", "empty-state");
     empty.append(node("span", "empty-icon", "⌕"), node("h3", "", "No spawns match just yet"), node("p", "", "Try a wider area or relax a filter, then search again."));
@@ -437,10 +454,21 @@ form.addEventListener("submit", async event => {
   $(".results-section").setAttribute("aria-busy", "true");
   announce("Searching for live spawns…");
   try {
-    const data = parseSearchResponse(await requestApi("search", payload, activeSearch.signal));
+    const key = searchKey(payload);
+    let entry = searches.get(key);
+    let cached = Boolean(entry);
+    if (!entry) {
+      const response = await requestApi("search", payload, activeSearch.signal);
+      if (generation !== state.generation) return;
+      const data = parseSearchResponse(response.data);
+      entry = { data, fetchedAt: response.fetchedAt };
+      searches.set(key, entry, Math.min(response.expiresAt, searchExpiry(data.results, response.fetchedAt)));
+      cached = response.cached;
+    }
     if (generation !== state.generation) return;
     announce("");
-    renderResults(data);
+    // Cards may mark an encounter expired; keep the cached response immutable.
+    renderResults(structuredClone(entry.data), entry.fetchedAt, cached);
   } catch (error) {
     if (generation !== state.generation || error.name === "AbortError") return;
     announce(`${error instanceof SearchError ? error.message : "Search failed. Please try again."}${state.cards.length ? " Previous results are still shown." : ""}`, "error");
@@ -593,6 +621,8 @@ function openConnection() {
 }
 
 function connectionChanged() {
+  searches.clear();
+  coordinates.clear();
   activeSearch?.abort();
   state.generation++;
   state.busy = false;
@@ -640,7 +670,7 @@ $("#connection-form").addEventListener("submit", async event => {
     let tier = "";
     if (token) {
       $("#save-connection").textContent = "Verifying account…";
-      const account = await requestApi("account", undefined, controller.signal, { endpoint: nextEndpoint, token });
+      const { data: account } = await requestApi("account", undefined, controller.signal, { endpoint: nextEndpoint, token });
       if (account?.authenticated !== true || !["free", "vip"].includes(account.tier)) throw new SearchError("The API server could not verify this provider account. Check the token and bridge deployment.");
       tier = account.tier;
     }
