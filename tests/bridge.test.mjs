@@ -33,7 +33,7 @@ test("a search forwards exactly one request and preserves all results", async ()
     calls++;
     assert.equal(url, "https://coordinates-api.pokemongopro.com/search");
     assert.equal(options.headers.Authorization, "Bearer visitor-token");
-    assert.equal(options.redirect, "error");
+    assert.equal(options.redirect, "manual");
     assert.deepEqual(JSON.parse(options.body), { shiny_only: true });
     return Response.json({ results, total_matches: 0 });
   });
@@ -41,6 +41,20 @@ test("a search forwards exactly one request and preserves all results", async ()
   assert.equal((await response.json()).results.length, 25);
   assert.equal(calls, 1);
   assert.equal(response.headers.get("cache-control"), "no-store");
+});
+
+test("provider redirects are rejected without another request or exposing their destination", async () => {
+  let calls = 0;
+  const response = await handleBridge(request("search", post({ cp_min: 0 }, { Authorization: "Bearer visitor-token" })), {}, async (url, options) => {
+    calls++;
+    assert.equal(url, "https://coordinates-api.pokemongopro.com/search");
+    assert.equal(options.redirect, "manual");
+    return new Response(null, { status: 302, headers: { Location: "https://unexpected.example/private" } });
+  });
+  assert.equal(calls, 1);
+  assert.equal(response.status, 502);
+  assert.equal(response.headers.get("location"), null);
+  assert.equal((await response.text()).includes("unexpected.example"), false);
 });
 
 test("anonymous reveal forwards no shared account token", async () => {

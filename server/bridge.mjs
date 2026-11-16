@@ -59,7 +59,8 @@ export async function handleBridge(request, env = {}, fetchUpstream = fetch) {
   const timeout = setTimeout(() => controller.abort(), 20000);
   try {
     const upstreamPath = reveal ? `reveal/${encodeURIComponent(revealCode)}` : "search";
-    const response = await fetchUpstream(`${UPSTREAM}/${upstreamPath}`, { method: request.method, headers, body, signal: controller.signal, redirect: "error" });
+    // Workers supports manual redirects only; reject 3xx below without following them.
+    const response = await fetchUpstream(`${UPSTREAM}/${upstreamPath}`, { method: request.method, headers, body, signal: controller.signal, redirect: "manual" });
     if (!response.ok) {
       const status = [400, 401, 403, 404, 410, 422, 429].includes(response.status) ? response.status : 502;
       let retryAfter = Number(response.headers.get("retry-after")) || null;
