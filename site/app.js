@@ -1,6 +1,7 @@
 import { buildSearchPayload, parseSearchResponse, parseCoordinates, remainingTime, normalizeEndpoint, SearchError } from "./search-core.mjs";
 import { POKEMON_PRESETS_KEY, MAX_PRESETS, MAX_PRESET_NAME, matchPokemonOptions, parsePokemonPresets, serializePokemonPresets } from "./pokemon-lists.mjs";
 import { ExpiringCache, searchKey, searchExpiry, encounterKey, coordinateExpiry, SEARCH_TTL } from "./cache.mjs";
+import { normalizeSearchPreset } from "./search-presets.mjs";
 
 const $ = selector => document.querySelector(selector);
 const form = $("#search-form");
@@ -219,17 +220,17 @@ function addPokemonSuggestion(option) {
 
 function updatePresetControls() {
   const selected = pokemonLists.presets.some(preset => preset.id === $("#pokemon-preset").value);
-  $("#save-pokemon-preset").disabled = !pokemonLists.available || !selectedPokemonOptions().length;
+  $("#save-pokemon-preset").disabled = !pokemonLists.available;
   $("#pokemon-preset").disabled = !pokemonLists.available || !pokemonLists.presets.length;
   $("#load-pokemon-preset").disabled = !pokemonLists.available || !pokemonLists.catalogReady || !selected;
   $("#delete-pokemon-preset").disabled = !pokemonLists.available || !selected;
 }
 
 function renderPokemonPresets(selectedId = $("#pokemon-preset").value) {
-  const placeholder = node("option", "", pokemonLists.presets.length ? "Choose a saved Pokémon list…" : "No saved presets yet");
+  const placeholder = node("option", "", pokemonLists.presets.length ? "Choose a saved search…" : "No saved searches yet");
   placeholder.value = "";
   $("#pokemon-preset").replaceChildren(placeholder, ...pokemonLists.presets.map(preset => {
-    const option = node("option", "", `${preset.name} (${preset.keys.length})`);
+    const option = node("option", "", `${preset.name} (${preset.keys.length ? `${preset.keys.length} Pokémon` : "any Pokémon"}${preset.search ? " · all filters" : " · Pokémon list"})`);
     option.value = preset.id;
     return option;
   }));
@@ -241,7 +242,7 @@ function readPokemonPresets() {
   try {
     pokemonLists.presets = parsePokemonPresets(localStorage.getItem(POKEMON_PRESETS_KEY));
     pokemonLists.available = true;
-    $("#pokemon-preset-message").textContent = "Presets are saved in this browser.";
+    $("#pokemon-preset-message").textContent = "Save all filters, even when searching for any Pokémon. Presets stay in this browser.";
   } catch (error) {
     pokemonLists.available = false;
     $("#pokemon-preset-message").textContent = error instanceof DOMException ? "Saved presets are unavailable because browser storage is blocked. You can still select Pokémon and search." : error.message;
@@ -261,7 +262,7 @@ function updatePresetSaveHint() {
   const name = $("#pokemon-preset-name").value.trim().toLowerCase();
   const exists = pokemonLists.presets.some(preset => preset.name.toLowerCase() === name);
   $("#confirm-pokemon-preset").textContent = exists ? "Update preset" : "Save preset";
-  $("#pokemon-preset-hint").textContent = exists ? "A preset with this name exists. Update replaces its saved Pokémon list." : "Saved in this browser, ready for your next visit.";
+  $("#pokemon-preset-hint").textContent = exists ? "A preset with this name exists. Update replaces its saved search filters." : "Saved in this browser, ready for your next visit.";
   $("#pokemon-preset-error").textContent = "";
 }
 
@@ -432,17 +433,22 @@ function renderResults(data, fetchedAt, cached) {
   for (const result of data.results) fragment.append(createResult(result));
   list.append(fragment);
   $("#results").replaceChildren(list);
-  if (data.cap && data.results.length >= data.cap) announce(`Showing all ${data.results.length} results returned. The provider reports a ${data.cap}-result account limit; more matches may exist.`);
+  announce(`Showing all ${data.results.length} results returned by the API.`);
+}
+
+function readSearchValues() {
+  const values = Object.fromEntries(new FormData(form));
+  values.sizes = new FormData(form).getAll("sizes");
+  values.location_mode = state.locationMode;
+  values.pvp_mode = state.pvp;
+  return values;
 }
 
 let activeSearch;
 form.addEventListener("submit", async event => {
   event.preventDefault();
   if (state.busy) return;
-  const raw = Object.fromEntries(new FormData(form));
-  raw.sizes = new FormData(form).getAll("sizes");
-  raw.location_mode = state.locationMode;
-  raw.pvp_mode = state.pvp;
+  const raw = readSearchValues();
   let payload;
   try { payload = buildSearchPayload(raw, state); }
   catch (error) { announce(error.message, "error"); $("#search-message").focus(); return; }
@@ -545,15 +551,18 @@ $("#pokemon-preset-form").addEventListener("submit", event => {
     const name = $("#pokemon-preset-name").value.trim();
     const keys = selectedPokemonOptions().map(option => option.key);
     if (!name || name.length > MAX_PRESET_NAME) throw new Error(`Enter a preset name from 1 to ${MAX_PRESET_NAME} characters.`);
-    if (!keys.length) throw new Error("Select at least one Pokémon before saving a preset.");
+    const values = readSearchValues();
+    values.shiny_only = values.shiny_only === "on";
+    values.background_only = values.background_only === "on";
+    const search = normalizeSearchPreset({ values, locationMode: state.locationMode, pvp: state.pvp, formMode: state.formMode, forms: state.forms });
     const presets = parsePokemonPresets(localStorage.getItem(POKEMON_PRESETS_KEY));
     const existing = presets.find(preset => preset.name.toLowerCase() === name.toLowerCase());
     if (!existing && presets.length >= MAX_PRESETS) throw new Error(`You can save up to ${MAX_PRESETS} presets. Delete one before adding another.`);
-    const preset = { id: existing?.id || crypto.randomUUID(), name, mode: state.pokemonMode, keys };
+    const preset = { id: existing?.id || crypto.randomUUID(), name, mode: state.pokemonMode, keys, search };
     writePokemonPresets(existing ? presets.map(item => item.id === existing.id ? preset : item) : [...presets, preset]);
     renderPokemonPresets(preset.id);
     $("#pokemon-preset-dialog").close();
-    toast(existing ? "Pokémon preset updated." : "Pokémon preset saved in this browser.");
+    toast(existing ? "Search preset updated." : "Search preset saved in this browser.");
   } catch (error) {
     $("#pokemon-preset-error").textContent = error instanceof DOMException ? "Could not access browser storage. Your Pokémon list is still available." : error.message;
   }
@@ -563,16 +572,34 @@ $("#load-pokemon-preset").addEventListener("click", () => {
   if (!preset || !pokemonLists.catalogReady) return;
   const keys = new Set(preset.keys);
   const options = state.options.filter(option => keys.has(option.key));
-  if (options.length !== keys.size) { $("#pokemon-preset-message").textContent = "This preset contains Pokémon missing from the current catalogue. Your selection has been kept."; return; }
+  if (options.length !== keys.size || preset.search?.forms.some(value => !state.formCatalog.includes(value))) { $("#pokemon-preset-message").textContent = "This preset contains Pokémon or forms missing from the current catalogue. Your filters have been kept."; return; }
+  if (preset.search) {
+    form.reset();
+    for (const [name, value] of Object.entries(preset.search.values)) {
+      for (const control of form.querySelectorAll(`[name="${name}"]`)) {
+        if (control.type === "checkbox") control.checked = Array.isArray(value) ? value.includes(control.value) : value;
+        else if (control.type === "radio") control.checked = control.value === value;
+        else control.value = value;
+      }
+    }
+    state.locationMode = preset.search.locationMode;
+    state.pvp = preset.search.pvp;
+    state.formMode = preset.search.formMode;
+    state.forms = [...preset.search.forms];
+    $("#form-mode").value = state.formMode;
+    $(".advanced").open = Boolean(preset.search.values.min_ttl || preset.search.values.shiny_account);
+    updateGroups();
+  }
   state.pokemonIds = [];
   state.speciesForms = [];
   for (const option of options) setPokemonSelected(option, true);
   state.pokemonMode = preset.mode;
+  $("#pokemon-preset").value = preset.id;
   $("#pokemon-mode").value = preset.mode;
   $("#pokemon-search").value = "";
   closePokemonSuggestions();
   updateSelection();
-  $("#pokemon-preset-message").textContent = `Loaded “${preset.name}”. Other search filters are unchanged. Tap Search Pokémon when ready.`;
+  $("#pokemon-preset-message").textContent = `Loaded “${preset.name}”. ${preset.search ? "All search filters restored." : "Pokémon list restored; other filters are unchanged."} Tap Search Pokémon when ready.`;
 });
 $("#delete-pokemon-preset").addEventListener("click", () => {
   const id = $("#pokemon-preset").value;

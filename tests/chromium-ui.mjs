@@ -167,6 +167,12 @@ try {
   assert.equal(searchCount, 0, "Typing, selecting and Enter must not send a spawn search");
   console.log("PASS: per-letter suggestions, touch selection, keyboard selection, empty matches and multiple species/forms use no API requests");
   await evaluate('document.querySelector("#pokemon-mode").value="exclude";document.querySelector("#pokemon-mode").dispatchEvent(new Event("change"))');
+  await click("#forms-picker");
+  await evaluate('document.querySelector("#picker-search").value="Alola";document.querySelector("#picker-search").dispatchEvent(new Event("input"))');
+  await click(".picker-option input");
+  await click("#picker-dialog [data-close]");
+  await evaluate('document.querySelector("#form-mode").value="exclude";document.querySelector("#form-mode").dispatchEvent(new Event("change"))');
+  await evaluate('document.querySelector("[name=cp_min]").value="222";document.querySelector("[name=level_min]").value="30";document.querySelector("#location").value="Tokyo";document.querySelector("#weather").value="boosted";document.querySelector("[name=shiny_only]").checked=true;document.querySelector("#sort").value="CP";document.querySelector("[name=sizes][value=XXL]").checked=true');
   const presetName = "My favorite Pokémon targets";
   await click("#save-pokemon-preset");
   for (const width of [320, 390, 768]) { await viewport(width); await noOverflow(`preset dialog ${width}`); }
@@ -183,7 +189,16 @@ try {
   await click("#load-pokemon-preset");
   assert.equal(await evaluate('document.querySelectorAll(".pokemon-chip").length'), 3);
   assert.equal(await evaluate('document.querySelector("#pokemon-mode").value'), "exclude");
-  assert.equal(await evaluate('document.querySelector("[name=cp_min]").value'), "111");
+  assert.equal(await evaluate('document.querySelector("[name=cp_min]").value'), "222");
+  assert.equal(await evaluate('document.querySelector("#location").value'), "Tokyo");
+  assert.equal(await evaluate('document.querySelector("#weather").value'), "boosted");
+  assert.equal(await evaluate('document.querySelector("[name=level_min]").value'), "30");
+  assert.equal(await evaluate('document.querySelector("[name=shiny_only]").checked'), true);
+  assert.equal(await evaluate('document.querySelector("[name=sizes][value=XXL]").checked'), true);
+  assert.equal(await evaluate('document.querySelector("#sort").value'), "CP");
+  assert.equal(await evaluate('document.querySelector("#form-mode").value'), "exclude");
+  assert.match(await evaluate('document.querySelector("#forms-summary").textContent'), /Alola/);
+  assert.equal(await evaluate('document.querySelector("#pokemon-preset").value'), presetId);
   assert.equal(searchCount, 0, "Loading a preset must not search automatically");
   await click("#search-button");
   await until('!document.querySelector("#search-button").disabled && document.querySelectorAll(".result-card").length===23');
@@ -191,8 +206,12 @@ try {
   assert.equal(lastPayload.blacklist_species_forms[0].pokemon_id, 26);
   assert.equal(lastPayload.blacklist_species_forms[0].form_id, 50);
   assert.deepEqual(lastPayload.pokemon_ids, []);
-  assert.equal(lastPayload.cp_min, 111);
-  console.log("PASS: a saved list survives reload, restores species/forms and exclusion mode, preserves other filters and submits the correct payload");
+  assert.equal(lastPayload.cp_min, 222);
+  assert.equal(lastPayload.location, "Tokyo");
+  assert.equal(lastPayload.boosted, true);
+  assert.deepEqual(lastPayload.sizes, ["XXL"]);
+  assert.deepEqual(lastPayload.blacklist_forms, ["Alola"]);
+  console.log("PASS: full search survives reload and restores Pokémon/form exclusions, CP, level, city, weather, sizes, shiny and sorting without an automatic search");
   await click('[aria-label="Remove Pikachu"]');
   await click("#save-pokemon-preset");
   await evaluate(`document.querySelector('#pokemon-preset-name').value=${JSON.stringify(presetName)};document.querySelector('#pokemon-preset-name').dispatchEvent(new Event('input'))`);
@@ -250,6 +269,7 @@ try {
   assert.equal(lastPayload.iv_percent_min, 100);
   assert.deepEqual(lastPayload.pokemon_ids, [147]);
   assert.match(await evaluate("document.querySelector('#search-message').textContent"), /all 23 results/);
+  assert.doesNotMatch(await evaluate("document.querySelector('#search-message').textContent"), /10|limit|account/);
   for (const width of [320, 360, 375, 390, 430, 520, 768, 850, 1024, 1280]) { await viewport(width); await noOverflow(`23 results ${width}`); }
   console.log("PASS: all 23 results rendered despite cap 10 / total_matches 0, at all 10 widths");
   await viewport(390);
@@ -479,6 +499,39 @@ try {
   await click(".find-button");
   assert.equal(revealCount, beforeExpiryReveals);
   console.log("PASS: changing endpoints clears both caches; despawn removes cached coordinates and prevents copying or revealing expired encounters");
+  await click("button[type=reset]");
+  assert.equal(await evaluate('document.querySelector("#save-pokemon-preset").disabled'), false);
+  assert.equal(await evaluate('document.querySelector("#save-pokemon-preset").textContent'), "Save search preset");
+  await click("[data-location=coords]");
+  await click("[data-stats=pvp]");
+  await evaluate('document.querySelector("#center_lat").value="0";document.querySelector("#center_lng").value="0";document.querySelector("#radius_km").value="10";document.querySelector("#sort").value="DISTANCE";document.querySelector("#pvp_league").value="ultra";document.querySelector("#pvp_top_rank").value="1";document.querySelector("#pvp_include_pre_evolutions").value="false"');
+  await savePreset("Any Pokémon PvP");
+  const anyPresetId = await evaluate('document.querySelector("#pokemon-preset").value');
+  assert.ok(anyPresetId);
+  const savedAny = JSON.parse(await evaluate('localStorage.getItem("pogo-pokemon-presets-v1")')).presets.find(p => p.id === anyPresetId);
+  assert.deepEqual(savedAny.keys, []);
+  assert.equal(savedAny.search.pvp, true);
+  await reload();
+  await evaluate(`document.querySelector('#pokemon-preset').value=${JSON.stringify(anyPresetId)};document.querySelector('#pokemon-preset').dispatchEvent(new Event('change'))`);
+  const beforePresetLoad = searchCount;
+  await click("#load-pokemon-preset");
+  assert.equal(await evaluate('document.querySelector("#coordinate-fields").hidden'), false);
+  assert.equal(await evaluate('document.querySelector("#pvp-fields").hidden'), false);
+  assert.equal(await evaluate('document.querySelector("#center_lat").value'), "0");
+  assert.equal(await evaluate('document.querySelector("#pvp_league").value'), "ultra");
+  assert.equal(await evaluate('document.querySelector("#pvp_include_pre_evolutions").value'), "false");
+  assert.equal(await evaluate('document.querySelector("#sort").value'), "DISTANCE");
+  assert.equal(searchCount, beforePresetLoad);
+  for (const width of [320, 390, 768, 1280]) { await viewport(width); await noOverflow(`saved full PvP preset ${width}`); }
+  const legacyPreset = { id: "legacy-list", name: "My old list", mode: "exclude", keys: ["p147"] };
+  await evaluate(`localStorage.setItem('pogo-pokemon-presets-v1',${JSON.stringify(JSON.stringify({version:1,presets:[legacyPreset]}))})`);
+  await reload();
+  await evaluate('document.querySelector("[name=cp_min]").value="456";document.querySelector("#pokemon-preset").value="legacy-list";document.querySelector("#pokemon-preset").dispatchEvent(new Event("change"))');
+  await click("#load-pokemon-preset");
+  assert.equal(await evaluate('document.querySelector("[name=cp_min]").value'), "456");
+  assert.equal(await evaluate('document.querySelectorAll(".pokemon-chip").length'), 1);
+  assert.equal(await evaluate('document.querySelector("#pokemon-mode").value'), "exclude");
+  console.log("PASS: prominent save control works with no Pokémon selected; complete PvP/coordinate presets survive reload; legacy Pokémon-only presets preserve other filters");
   assert.deepEqual(errors, [], "No uncaught browser errors");
   console.log(`PASS: no uncaught browser exceptions; ${searchCount} fixture searches, ${revealCount} reveal; screenshots saved`);
 } finally { ws.close(); }

@@ -38,7 +38,7 @@ test("presets persist multiple species and forms, mode and Unicode names without
 });
 
 test("malformed or unsupported storage is reported instead of becoming an empty preset list", () => {
-  for (const raw of ["", "broken json", "null", "[]", '{"version":2,"presets":[]}', '{"version":1,"presets":{}}']) assert.throws(() => parsePokemonPresets(raw));
+  for (const raw of ["", "broken json", "null", "[]", '{"version":3,"presets":[]}', '{"version":1,"presets":{}}']) assert.throws(() => parsePokemonPresets(raw));
   assert.throws(() => parsePokemonPresets("x".repeat(2 * 1024 * 1024 + 1)));
 });
 
