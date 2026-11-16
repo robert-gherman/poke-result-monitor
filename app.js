@@ -5,9 +5,12 @@ const $ = selector => document.querySelector(selector);
 const form = $("#search-form");
 const state = { pokemonMode: "include", formMode: "include", pokemonIds: [], speciesForms: [], forms: [], locationMode: "area", pvp: false, catalog: [], formCatalog: [], options: [], picker: "pokemon", token: "", busy: false, generation: 0, cards: [] };
 const pokemonLists = { presets: [], available: true, catalogReady: false, suggestions: [], active: -1 };
+const revealAccess = { retryAt: 0, busy: false, issue: "", generation: 0, controller: null };
+let accountTier = "";
 let toastTimer;
 let endpoint = "";
-let configuredEndpoint = window.POGO_CONFIG?.apiEndpoint || "";
+// Local development/personal use takes the computer's direct bridge by default.
+let configuredEndpoint = ["localhost", "127.0.0.1"].includes(location.hostname) ? new URL("./api/bridge", location.href).href : window.POGO_CONFIG?.apiEndpoint || "";
 try { configuredEndpoint = localStorage.getItem("pogo-api-endpoint") || configuredEndpoint; } catch { /* Use public configuration when browser storage is blocked. */ }
 try { endpoint = normalizeEndpoint(configuredEndpoint, location.href); } catch { /* Invalid saved URL: use the connection dialog. */ }
 if (!endpoint && !location.hostname.endsWith("github.io")) endpoint = new URL("./api/bridge", location.href).href;
@@ -51,25 +54,27 @@ function updateGroups() {
   for (const button of document.querySelectorAll("[data-stats]")) button.setAttribute("aria-pressed", (button.dataset.stats === "pvp") === state.pvp);
 }
 
-async function requestApi(route, payload, signal) {
-  if (!endpoint) throw new SearchError("Connect your API server using the settings button to start searching.");
-  const url = new URL(endpoint);
+async function requestApi(route, payload, signal, connection = { endpoint, token: state.token }) {
+  if (!connection.endpoint) throw new SearchError("Connect your API server using the settings button to start searching.");
+  const url = new URL(connection.endpoint);
   url.searchParams.set("route", route);
   const controller = new AbortController();
   const abort = () => controller.abort();
   signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
   const timeout = setTimeout(abort, 25000);
   try {
     const headers = { Accept: "application/json" };
     if (payload !== undefined) headers["Content-Type"] = "application/json";
-    if (state.token) headers.Authorization = `Bearer ${state.token}`;
+    if (connection.token) headers.Authorization = `Bearer ${connection.token}`;
     const response = await fetch(url, { method: payload === undefined ? "GET" : "POST", headers, body: payload === undefined ? undefined : JSON.stringify(payload), signal: controller.signal, credentials: "omit", cache: "no-store", redirect: "error" });
     let data;
     try { data = await response.json(); } catch { throw new SearchError("The API server returned an invalid response. Check its URL in connection settings."); }
     if (!response.ok) {
-      const error = new SearchError(response.status === 401 || response.status === 403 ? "Access was rejected. Check your provider token and API server settings." : response.status === 429 ? `Provider limit reached. Try again${Number.isFinite(data.retry_after) ? ` in ${Math.max(1, Math.ceil(data.retry_after))} seconds` : " later"}.` : response.status === 404 || response.status === 410 ? "This encounter has expired or is no longer available." : "The search service is unavailable. Try again in a moment.");
+      const retryAfter = typeof data?.retry_after === "number" && Number.isFinite(data.retry_after) && data.retry_after > 0 ? Math.min(86400, Math.ceil(data.retry_after)) : 60;
+      const error = new SearchError(response.status === 401 || response.status === 403 ? "Access was rejected. Verify your provider token in connection settings; it may have expired." : response.status === 429 ? `The data provider is limiting requests. Wait ${retryAfter}s before trying again. This is separate from Cloudflare's free hosting quota.` : response.status === 404 || response.status === 410 ? route === "account" ? "This bridge does not support account verification. Deploy the latest bridge, then try again." : "This encounter has expired or is no longer available." : "The search service is unavailable. Try again in a moment.");
       error.status = response.status;
-      error.retryAfter = data.retry_after;
+      error.retryAfter = retryAfter;
       throw error;
     }
     return data;
@@ -81,6 +86,17 @@ async function requestApi(route, payload, signal) {
     clearTimeout(timeout);
     signal?.removeEventListener("abort", abort);
   }
+}
+
+function updateRevealAccess() {
+  const waiting = Math.max(0, Math.ceil((revealAccess.retryAt - Date.now()) / 1000));
+  $("#provider-notice").hidden = !revealAccess.issue;
+  if (revealAccess.issue) {
+    $("#provider-status").textContent = revealAccess.issue === "auth" ? "Provider access rejected" : "Provider reveal limit";
+    $("#provider-guidance").textContent = revealAccess.issue === "auth" ? "Check your account token in connection settings, then search again." : `${state.token ? "Your provider account is rate-limited. Check your limits on the provider website." : "Guest reveals through the shared Cloudflare connection are limited. Connect your own provider account, or use the provider website."} ${waiting ? `Find is paused for ${waiting}s. No automatic retries.` : "The cooldown has ended. You can try Find once; access is still controlled by the provider."}`;
+    $("#provider-connect").textContent = state.token ? "Check connection" : "Connect provider account";
+  }
+  for (const card of state.cards) card.tick();
 }
 
 async function loadCatalog() {
@@ -327,7 +343,6 @@ function createResult(result) {
   find.setAttribute("aria-label", `Find ${text(result.pokemon_name, "Pokémon")} and copy coordinates`);
   let coords = "";
   let busy = false;
-  let retryAt = 0;
   const errorBox = node("div", "card-error");
   errorBox.setAttribute("role", "status");
   errorBox.hidden = true;
@@ -338,28 +353,43 @@ function createResult(result) {
     card.classList.toggle("is-expired", time.expired);
     countdown.textContent = `${time.expired ? "" : "◷ "}${time.text}${result.despawn_verified === false ? " · estimated" : ""}`;
     countdown.classList.toggle("urgent", time.urgent);
-    const waiting = Math.max(0, Math.ceil((retryAt - Date.now()) / 1000));
-    find.disabled = busy || time.expired || waiting > 0 || (!coords && !result.reveal_code);
-    if (!busy) find.textContent = time.expired ? "Despawned" : waiting ? `Retry in ${waiting}s` : coords ? "Copy again" : !result.reveal_code ? "Unavailable" : "⌖ Find";
+    const waiting = !coords && Math.max(0, Math.ceil((revealAccess.retryAt - Date.now()) / 1000));
+    find.disabled = busy || time.expired || (!coords && (revealAccess.busy || revealAccess.issue === "auth" || waiting > 0 || !result.reveal_code));
+    if (!busy) find.textContent = time.expired ? "Despawned" : coords ? "Copy again" : waiting ? `Retry in ${waiting}s` : revealAccess.issue === "auth" ? "Check account" : !result.reveal_code ? "Unavailable" : revealAccess.busy ? "Please wait…" : "⌖ Find";
   };
   find.addEventListener("click", async () => {
     if (find.disabled || busy) return;
     if (coords) { await copyCoordinates(coords); return; }
+    // Serialize reveals so another card cannot spend quota while one is pending.
+    if (revealAccess.busy || revealAccess.retryAt > Date.now() || revealAccess.issue === "auth") return;
+    const generation = revealAccess.generation;
+    const controller = new AbortController();
+    revealAccess.controller = controller;
+    revealAccess.busy = true;
     busy = true;
     find.disabled = true;
     find.textContent = "Finding…";
     errorBox.hidden = true;
+    updateRevealAccess();
     try {
-      coords = parseCoordinates(await requestApi(`reveal/${encodeURIComponent(result.reveal_code)}`));
+      const data = await requestApi(`reveal/${encodeURIComponent(result.reveal_code)}`, undefined, controller.signal);
+      if (generation !== revealAccess.generation) return;
+      coords = parseCoordinates(data);
+      revealAccess.issue = "";
       coordBox.textContent = coords;
       coordBox.hidden = false;
       await copyCoordinates(coords);
     } catch (error) {
+      if (generation !== revealAccess.generation || error.name === "AbortError") return;
       errorBox.textContent = error instanceof SearchError ? error.message : "Unable to find coordinates. Try again.";
       errorBox.hidden = false;
-      if (error.status === 429) retryAt = Date.now() + Math.max(1, Number(error.retryAfter) || 60) * 1000;
+      if (error.status === 429) { revealAccess.retryAt = Date.now() + error.retryAfter * 1000; revealAccess.issue = "limit"; }
+      if (error.status === 401 || error.status === 403) { revealAccess.issue = "auth"; accountTier = ""; }
       if (error.status === 404 || error.status === 410) result.despawn_at = new Date(0).toISOString();
-    } finally { busy = false; tick(); }
+    } finally {
+      busy = false;
+      if (generation === revealAccess.generation) { revealAccess.busy = false; revealAccess.controller = null; updateRevealAccess(); }
+    }
   });
   actions.append(countdown, find);
   card.append(image, main, actions, coordBox, errorBox);
@@ -558,30 +588,88 @@ function openConnection() {
   $("#api-endpoint").value = endpoint;
   $("#api-token").value = state.token;
   $("#connection-error").textContent = "";
+  $("#provider-account-state").textContent = state.token ? accountTier ? `Verified provider account (${accountTier === "vip" ? "VIP" : "free"}) for this tab. Provider limits still apply.` : "Your provider token needs verification. Save to check it, or replace it with a fresh token." : "Guest access. The shared Cloudflare connection may be limited even before your first reveal.";
   $("#connection-dialog").showModal();
 }
 
+function connectionChanged() {
+  activeSearch?.abort();
+  state.generation++;
+  state.busy = false;
+  $("#search-button").disabled = false;
+  $("#search-button span").textContent = "Search Pokémon";
+  $(".results-section").setAttribute("aria-busy", "false");
+  revealAccess.controller?.abort();
+  revealAccess.generation++;
+  revealAccess.controller = null;
+  revealAccess.busy = false;
+  revealAccess.retryAt = 0;
+  revealAccess.issue = "";
+  state.cards = [];
+  $("#result-count").textContent = "0";
+  $("#results-meta").textContent = "Connection changed";
+  const empty = node("div", "empty-state");
+  empty.append(node("h3", "", "Ready for a new search"), node("p", "", "Connection changed. Search again to get fresh encounters with your current access."));
+  $("#results").replaceChildren(empty);
+  announce("");
+  updateRevealAccess();
+}
+
+let connectionCheck;
 $("#connection-button").addEventListener("click", openConnection);
 $("#setup-button").addEventListener("click", openConnection);
-$("#connection-form").addEventListener("submit", event => {
+$("#provider-connect").addEventListener("click", openConnection);
+$("#connection-dialog").addEventListener("close", () => {
+  connectionCheck?.abort();
+  $("#api-token").value = "";
+});
+$("#connection-form").addEventListener("submit", async event => {
   event.preventDefault();
+  if (connectionCheck) return;
+  const controller = new AbortController();
+  connectionCheck = controller;
+  $("#save-connection").disabled = true;
+  $("#clear-connection").disabled = true;
+  $("#connection-form").setAttribute("aria-busy", "true");
+  $("#connection-error").textContent = "";
   try {
     const nextEndpoint = normalizeEndpoint($("#api-endpoint").value, location.href);
     if (!nextEndpoint) throw new SearchError("Enter the URL of your API server.");
     const token = $("#api-token").value.trim().replace(/^Bearer\s+/i, "");
-    if (/\s/.test(token)) throw new SearchError("The provider token cannot contain spaces or new lines.");
+    if (/\s/.test(token) || token.length > 8192) throw new SearchError("Enter a provider token with no spaces or new lines (up to 8192 characters).");
+    let tier = "";
+    if (token) {
+      $("#save-connection").textContent = "Verifying account…";
+      const account = await requestApi("account", undefined, controller.signal, { endpoint: nextEndpoint, token });
+      if (account?.authenticated !== true || !["free", "vip"].includes(account.tier)) throw new SearchError("The API server could not verify this provider account. Check the token and bridge deployment.");
+      tier = account.tier;
+    }
+    if (controller.signal.aborted || !$("#connection-dialog").open) return;
+    const changed = endpoint !== nextEndpoint || state.token !== token;
     endpoint = nextEndpoint;
     state.token = token;
+    accountTier = tier;
+    if (changed || (token && revealAccess.issue === "auth")) connectionChanged();
     let saved = true;
     try { localStorage.setItem("pogo-api-endpoint", endpoint); } catch { saved = false; }
     $("#connection-dialog").close();
     $("#api-token").value = "";
     $("#connection-notice").hidden = true;
-    toast(saved ? "Connection settings saved." : "Connection ready for this tab. Browser storage is unavailable.");
-  } catch (error) { $("#connection-error").textContent = error.message; }
+    toast(token ? "Provider account verified for this tab. Search again to use it." : saved ? "Guest connection saved. Provider limits still apply." : "Guest connection ready for this tab. Browser storage is unavailable.");
+  } catch (error) {
+    if (!controller.signal.aborted) $("#connection-error").textContent = error instanceof SearchError ? error.message : "Could not save this connection. Try again.";
+  } finally {
+    if (connectionCheck === controller) connectionCheck = null;
+    $("#save-connection").disabled = false;
+    $("#clear-connection").disabled = false;
+    $("#save-connection").textContent = "Save connection";
+    $("#connection-form").setAttribute("aria-busy", "false");
+  }
 });
 $("#clear-connection").addEventListener("click", () => {
   state.token = ""; endpoint = "";
+  accountTier = "";
+  connectionChanged();
   try { localStorage.removeItem("pogo-api-endpoint"); } catch { /* Storage may be disabled. */ }
   $("#api-endpoint").value = "";
   $("#api-token").value = "";
@@ -596,4 +684,4 @@ $("#forms-picker").disabled = true;
 updateGroups();
 readPokemonPresets();
 loadCatalog();
-setInterval(() => { for (const card of state.cards) card.tick(); }, 1000);
+setInterval(updateRevealAccess, 1000);
