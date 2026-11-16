@@ -1,11 +1,15 @@
 import { buildSearchPayload, parseSearchResponse, parseCoordinates, remainingTime, normalizeEndpoint, SearchError } from "./search-core.mjs";
+import { POKEMON_PRESETS_KEY, MAX_PRESETS, MAX_PRESET_NAME, matchPokemonOptions, parsePokemonPresets, serializePokemonPresets } from "./pokemon-lists.mjs";
 
 const $ = selector => document.querySelector(selector);
 const form = $("#search-form");
 const state = { pokemonMode: "include", formMode: "include", pokemonIds: [], speciesForms: [], forms: [], locationMode: "area", pvp: false, catalog: [], formCatalog: [], options: [], picker: "pokemon", token: "", busy: false, generation: 0, cards: [] };
+const pokemonLists = { presets: [], available: true, catalogReady: false, suggestions: [], active: -1 };
 let toastTimer;
 let endpoint = "";
-try { endpoint = normalizeEndpoint(localStorage.getItem("pogo-api-endpoint") || window.POGO_CONFIG?.apiEndpoint || "", location.href); } catch { /* Invalid or blocked storage: use the connection dialog. */ }
+let configuredEndpoint = window.POGO_CONFIG?.apiEndpoint || "";
+try { configuredEndpoint = localStorage.getItem("pogo-api-endpoint") || configuredEndpoint; } catch { /* Use public configuration when browser storage is blocked. */ }
+try { endpoint = normalizeEndpoint(configuredEndpoint, location.href); } catch { /* Invalid saved URL: use the connection dialog. */ }
 if (!endpoint && !location.hostname.endsWith("github.io")) endpoint = new URL("./api/bridge", location.href).href;
 
 function node(tag, className = "", text = "") {
@@ -99,7 +103,10 @@ async function loadCatalog() {
       }
     }
     $("#pokemon-picker").disabled = false;
+    $("#pokemon-search").disabled = false;
     $("#forms-picker").disabled = false;
+    pokemonLists.catalogReady = true;
+    updatePresetControls();
   } catch {
     announce("Pokémon filter options could not load. Reload the page to try again; the other filters remain available.", "error");
   }
@@ -111,20 +118,132 @@ function optionSelected(option) {
 
 function selectedPokemonOptions() { return state.options.filter(optionSelected); }
 
+function setPokemonSelected(option, selected) {
+  if (option.species) state.pokemonIds = selected ? [...new Set([...state.pokemonIds, option.pokemon_id])] : state.pokemonIds.filter(id => id !== option.pokemon_id);
+  else {
+    state.speciesForms = state.speciesForms.filter(s => !(s.pokemon_id === option.pokemon_id && s.form_id === option.form_id && (s.costume_id ?? null) === option.costume_id));
+    if (selected) state.speciesForms.push({ pokemon_id: option.pokemon_id, form_id: option.form_id, costume_id: option.costume_id });
+  }
+}
+
 function updateSelection() {
   const options = selectedPokemonOptions();
   const excluded = state.pokemonMode === "exclude";
-  $("#pokemon-summary").textContent = options.length ? `${options.length} ${excluded ? "excluded" : "selected"} · ${options.map(o => o.label).join(", ")}` : "Any Pokémon";
+  $("#pokemon-summary").textContent = options.length ? `${options.length} Pokémon ${excluded ? "excluded" : "selected"}` : "Any Pokémon";
   $("#forms-summary").textContent = state.forms.length ? `${state.forms.length} ${state.formMode === "exclude" ? "excluded" : "selected"} · ${state.forms.join(", ")}` : "Any form";
-  $("#pokemon-chips").replaceChildren(...options.slice(0, 5).map(o => node("span", "chip", `${excluded ? "− " : ""}${o.label}`)));
-  if (options.length > 5) $("#pokemon-chips").append(node("span", "chip", `+${options.length - 5} more`));
+  $("#pokemon-chips").replaceChildren(...options.map(option => {
+    const chip = node("li", "pokemon-chip");
+    const remove = node("button", "remove-pokemon", "×");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `Remove ${option.label}`);
+    remove.addEventListener("click", () => {
+      setPokemonSelected(option, false);
+      updateSelection();
+      $("#pokemon-search").focus();
+    });
+    chip.append(node("span", "", `${excluded ? "− " : ""}${option.label}`), remove);
+    return chip;
+  }));
   $("#selection-count").textContent = `${state.picker === "pokemon" ? options.length : state.forms.length} selected`;
+  updatePresetControls();
+}
+
+function closePokemonSuggestions() {
+  $("#pokemon-suggestions").hidden = true;
+  $("#pokemon-search").setAttribute("aria-expanded", "false");
+  $("#pokemon-search").removeAttribute("aria-activedescendant");
+  $("#pokemon-suggestion-status").textContent = "";
+  pokemonLists.active = -1;
+}
+
+function renderPokemonSuggestions() {
+  const input = $("#pokemon-search");
+  if (!input.value.trim() || !pokemonLists.catalogReady) { closePokemonSuggestions(); return; }
+  const matches = matchPokemonOptions(state.options, input.value).filter(option => !optionSelected(option));
+  pokemonLists.suggestions = matches.slice(0, 12);
+  pokemonLists.active = -1;
+  input.removeAttribute("aria-activedescendant");
+  const items = pokemonLists.suggestions.map((option, index) => {
+    const item = node("li", "pokemon-suggestion");
+    item.id = `pokemon-suggestion-${index}`;
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", "false");
+    item.append(node("span", "", option.label), node("small", "", `#${String(option.pokemon_id).padStart(3, "0")}`));
+    item.addEventListener("pointerdown", event => event.preventDefault());
+    item.addEventListener("click", () => addPokemonSuggestion(option));
+    return item;
+  });
+  if (!items.length) {
+    const empty = node("li", "picker-empty", "No more matches. Try another Pokémon name or number.");
+    empty.setAttribute("role", "presentation");
+    items.push(empty);
+  }
+  $("#pokemon-suggestions").replaceChildren(...items);
+  $("#pokemon-suggestions").hidden = false;
+  input.setAttribute("aria-expanded", "true");
+  $("#pokemon-suggestion-status").textContent = matches.length > 12 ? `${matches.length} matches. Showing the first 12; keep typing to narrow them down.` : `${matches.length} matches. Use the arrow keys to choose and Enter to add.`;
+}
+
+function addPokemonSuggestion(option) {
+  setPokemonSelected(option, true);
+  $("#pokemon-search").value = "";
+  closePokemonSuggestions();
+  updateSelection();
+  $("#pokemon-search").focus();
+}
+
+function updatePresetControls() {
+  const selected = pokemonLists.presets.some(preset => preset.id === $("#pokemon-preset").value);
+  $("#save-pokemon-preset").disabled = !pokemonLists.available || !selectedPokemonOptions().length;
+  $("#pokemon-preset").disabled = !pokemonLists.available || !pokemonLists.presets.length;
+  $("#load-pokemon-preset").disabled = !pokemonLists.available || !pokemonLists.catalogReady || !selected;
+  $("#delete-pokemon-preset").disabled = !pokemonLists.available || !selected;
+}
+
+function renderPokemonPresets(selectedId = $("#pokemon-preset").value) {
+  const placeholder = node("option", "", pokemonLists.presets.length ? "Choose a saved Pokémon list…" : "No saved presets yet");
+  placeholder.value = "";
+  $("#pokemon-preset").replaceChildren(placeholder, ...pokemonLists.presets.map(preset => {
+    const option = node("option", "", `${preset.name} (${preset.keys.length})`);
+    option.value = preset.id;
+    return option;
+  }));
+  $("#pokemon-preset").value = pokemonLists.presets.some(preset => preset.id === selectedId) ? selectedId : "";
+  updatePresetControls();
+}
+
+function readPokemonPresets() {
+  try {
+    pokemonLists.presets = parsePokemonPresets(localStorage.getItem(POKEMON_PRESETS_KEY));
+    pokemonLists.available = true;
+    $("#pokemon-preset-message").textContent = "Presets are saved in this browser.";
+  } catch (error) {
+    pokemonLists.available = false;
+    $("#pokemon-preset-message").textContent = error instanceof DOMException ? "Saved presets are unavailable because browser storage is blocked. You can still select Pokémon and search." : error.message;
+  }
+  renderPokemonPresets();
+  if ($("#pokemon-preset-dialog").open) updatePresetSaveHint();
+}
+
+function writePokemonPresets(presets) {
+  const serialized = serializePokemonPresets(presets);
+  try { localStorage.setItem(POKEMON_PRESETS_KEY, serialized); }
+  catch { throw new Error("Could not save presets. Browser storage may be full or blocked. Your selected Pokémon have been kept."); }
+  pokemonLists.presets = presets;
+}
+
+function updatePresetSaveHint() {
+  const name = $("#pokemon-preset-name").value.trim().toLowerCase();
+  const exists = pokemonLists.presets.some(preset => preset.name.toLowerCase() === name);
+  $("#confirm-pokemon-preset").textContent = exists ? "Update preset" : "Save preset";
+  $("#pokemon-preset-hint").textContent = exists ? "A preset with this name exists. Update replaces its saved Pokémon list." : "Saved in this browser, ready for your next visit.";
+  $("#pokemon-preset-error").textContent = "";
 }
 
 function renderPicker() {
-  const search = $("#picker-search").value.trim().toLowerCase();
+  const search = $("#picker-search").value;
   const options = state.picker === "pokemon" ? state.options : state.formCatalog.map(value => ({ key: value, label: value.replaceAll("_", " ") }));
-  const matches = options.filter(o => !search || o.label.toLowerCase().includes(search) || String(o.pokemon_id || "").padStart(3, "0").includes(search));
+  const matches = matchPokemonOptions(options, search);
   const fragment = document.createDocumentFragment();
   for (const option of matches) {
     const label = node("label", "picker-option");
@@ -133,9 +252,7 @@ function renderPicker() {
     input.checked = state.picker === "pokemon" ? optionSelected(option) : state.forms.includes(option.key);
     input.addEventListener("change", () => {
       if (state.picker === "forms") state.forms = input.checked ? [...state.forms, option.key] : state.forms.filter(f => f !== option.key);
-      else if (option.species) state.pokemonIds = input.checked ? [...state.pokemonIds, option.pokemon_id] : state.pokemonIds.filter(id => id !== option.pokemon_id);
-      else if (input.checked) state.speciesForms.push({ pokemon_id: option.pokemon_id, form_id: option.form_id, costume_id: option.costume_id });
-      else state.speciesForms = state.speciesForms.filter(s => !(s.pokemon_id === option.pokemon_id && s.form_id === option.form_id && (s.costume_id ?? null) === option.costume_id));
+      else setPokemonSelected(option, input.checked);
       updateSelection();
     });
     label.append(input, node("span", "", option.label));
@@ -148,6 +265,7 @@ function renderPicker() {
 }
 
 function openPicker(type) {
+  closePokemonSuggestions();
   state.picker = type;
   $("#picker-title").textContent = type === "pokemon" ? "Select Pokémon" : "Select forms";
   $("#picker-search").value = "";
@@ -313,6 +431,7 @@ form.addEventListener("reset", () => {
   state.pokemonIds = []; state.speciesForms = []; state.forms = [];
   state.pokemonMode = state.formMode = "include";
   state.locationMode = "area"; state.pvp = false;
+  closePokemonSuggestions();
   $("#search-button").disabled = false;
   $("#search-button span").textContent = "Search Pokémon";
   $(".results-section").setAttribute("aria-busy", "false");
@@ -329,6 +448,83 @@ $("#pokemon-picker").addEventListener("click", () => openPicker("pokemon"));
 $("#forms-picker").addEventListener("click", () => openPicker("forms"));
 $("#picker-search").addEventListener("input", renderPicker);
 $("#clear-selection").addEventListener("click", () => { if (state.picker === "pokemon") { state.pokemonIds = []; state.speciesForms = []; } else state.forms = []; renderPicker(); });
+$("#pokemon-search").addEventListener("input", renderPokemonSuggestions);
+$("#pokemon-search").addEventListener("focus", renderPokemonSuggestions);
+$("#pokemon-autocomplete").addEventListener("focusout", event => { if (!event.currentTarget.contains(event.relatedTarget)) closePokemonSuggestions(); });
+document.addEventListener("pointerdown", event => { if (!$("#pokemon-autocomplete").contains(event.target)) closePokemonSuggestions(); });
+$("#pokemon-search").addEventListener("keydown", event => {
+  if (event.isComposing) return;
+  if (event.key === "Escape") { event.preventDefault(); closePokemonSuggestions(); return; }
+  if (event.key === "Enter") {
+    event.preventDefault();
+    if (!$("#pokemon-suggestions").hidden && pokemonLists.suggestions.length) addPokemonSuggestion(pokemonLists.suggestions[Math.max(0, pokemonLists.active)]);
+    return;
+  }
+  if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
+  event.preventDefault();
+  if ($("#pokemon-suggestions").hidden) renderPokemonSuggestions();
+  if (!pokemonLists.suggestions.length || $("#pokemon-suggestions").hidden) return;
+  const direction = event.key === "ArrowDown" ? 1 : -1;
+  pokemonLists.active = pokemonLists.active < 0 ? (direction > 0 ? 0 : pokemonLists.suggestions.length - 1) : (pokemonLists.active + direction + pokemonLists.suggestions.length) % pokemonLists.suggestions.length;
+  for (const [index, item] of [...$("#pokemon-suggestions").children].entries()) item.setAttribute("aria-selected", String(index === pokemonLists.active));
+  const active = $(`#pokemon-suggestion-${pokemonLists.active}`);
+  $("#pokemon-search").setAttribute("aria-activedescendant", active.id);
+  active.scrollIntoView({ block: "nearest" });
+});
+
+$("#pokemon-preset").addEventListener("change", updatePresetControls);
+$("#save-pokemon-preset").addEventListener("click", () => {
+  $("#pokemon-preset-name").value = "";
+  updatePresetSaveHint();
+  $("#pokemon-preset-dialog").showModal();
+  $("#pokemon-preset-name").focus();
+});
+$("#pokemon-preset-name").addEventListener("input", updatePresetSaveHint);
+$("#pokemon-preset-form").addEventListener("submit", event => {
+  event.preventDefault();
+  try {
+    const name = $("#pokemon-preset-name").value.trim();
+    const keys = selectedPokemonOptions().map(option => option.key);
+    if (!name || name.length > MAX_PRESET_NAME) throw new Error(`Enter a preset name from 1 to ${MAX_PRESET_NAME} characters.`);
+    if (!keys.length) throw new Error("Select at least one Pokémon before saving a preset.");
+    const presets = parsePokemonPresets(localStorage.getItem(POKEMON_PRESETS_KEY));
+    const existing = presets.find(preset => preset.name.toLowerCase() === name.toLowerCase());
+    if (!existing && presets.length >= MAX_PRESETS) throw new Error(`You can save up to ${MAX_PRESETS} presets. Delete one before adding another.`);
+    const preset = { id: existing?.id || crypto.randomUUID(), name, mode: state.pokemonMode, keys };
+    writePokemonPresets(existing ? presets.map(item => item.id === existing.id ? preset : item) : [...presets, preset]);
+    renderPokemonPresets(preset.id);
+    $("#pokemon-preset-dialog").close();
+    toast(existing ? "Pokémon preset updated." : "Pokémon preset saved in this browser.");
+  } catch (error) {
+    $("#pokemon-preset-error").textContent = error instanceof DOMException ? "Could not access browser storage. Your Pokémon list is still available." : error.message;
+  }
+});
+$("#load-pokemon-preset").addEventListener("click", () => {
+  const preset = pokemonLists.presets.find(item => item.id === $("#pokemon-preset").value);
+  if (!preset || !pokemonLists.catalogReady) return;
+  const keys = new Set(preset.keys);
+  const options = state.options.filter(option => keys.has(option.key));
+  if (options.length !== keys.size) { $("#pokemon-preset-message").textContent = "This preset contains Pokémon missing from the current catalogue. Your selection has been kept."; return; }
+  state.pokemonIds = [];
+  state.speciesForms = [];
+  for (const option of options) setPokemonSelected(option, true);
+  state.pokemonMode = preset.mode;
+  $("#pokemon-mode").value = preset.mode;
+  $("#pokemon-search").value = "";
+  closePokemonSuggestions();
+  updateSelection();
+  $("#pokemon-preset-message").textContent = `Loaded “${preset.name}”. Other search filters are unchanged. Tap Search Pokémon when ready.`;
+});
+$("#delete-pokemon-preset").addEventListener("click", () => {
+  const id = $("#pokemon-preset").value;
+  try {
+    const presets = parsePokemonPresets(localStorage.getItem(POKEMON_PRESETS_KEY));
+    writePokemonPresets(presets.filter(preset => preset.id !== id));
+    renderPokemonPresets("");
+    $("#pokemon-preset-message").textContent = "Preset deleted. Your current Pokémon selection has been kept.";
+  } catch (error) { $("#pokemon-preset-message").textContent = error instanceof DOMException ? "Could not access browser storage. The preset has been kept." : error.message; }
+});
+window.addEventListener("storage", event => { if (event.key === POKEMON_PRESETS_KEY || event.key === null) readPokemonPresets(); });
 for (const button of document.querySelectorAll("[data-close]")) button.addEventListener("click", () => button.closest("dialog").close());
 
 $("#geolocate").addEventListener("click", () => {
@@ -398,5 +594,6 @@ $("#connection-notice").hidden = Boolean(endpoint);
 $("#pokemon-picker").disabled = true;
 $("#forms-picker").disabled = true;
 updateGroups();
+readPokemonPresets();
 loadCatalog();
 setInterval(() => { for (const card of state.cards) card.tick(); }, 1000);

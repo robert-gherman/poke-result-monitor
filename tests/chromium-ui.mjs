@@ -38,6 +38,10 @@ ws.addEventListener("message", async event => {
   else if (data.method === "Fetch.requestPaused") {
     try {
       const { requestId, request } = data.params;
+      if (new URL(request.url).pathname.endsWith("/config.js")) {
+        await send("Fetch.fulfillRequest", { requestId, responseCode: 200, responseHeaders: [{ name: "Content-Type", value: "text/javascript" }], body: Buffer.from('window.POGO_CONFIG={apiEndpoint:"http://127.0.0.1:4173/api/bridge"};').toString("base64") });
+        return;
+      }
       const route = new URL(request.url).searchParams.get("route");
       if (route === "search") {
         searchCount++;
@@ -64,6 +68,31 @@ async function until(expression) {
   throw new Error(`Timed out: ${expression}`);
 }
 const click = selector => evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`, true);
+const ready = () => until('location.origin === "http://127.0.0.1:4173" && document.readyState === "complete" && !document.documentElement.dataset.reloading && window.POGO_CONFIG && !document.querySelector("#pokemon-search").disabled');
+async function reload() {
+  await evaluate('document.documentElement.dataset.reloading="true"');
+  await send("Page.reload");
+  await ready();
+}
+async function key(key) {
+  const windowsVirtualKeyCode = { ArrowDown: 40, ArrowUp: 38, Enter: 13, Escape: 27 }[key];
+  await send("Input.dispatchKeyEvent", { type: "keyDown", key, windowsVirtualKeyCode });
+  await send("Input.dispatchKeyEvent", { type: "keyUp", key, windowsVirtualKeyCode });
+}
+async function typePokemon(text) {
+  await evaluate('document.querySelector("#pokemon-search").scrollIntoView({block:"center"});document.querySelector("#pokemon-search").focus();document.querySelector("#pokemon-search").value="";document.querySelector("#pokemon-search").dispatchEvent(new Event("input"))');
+  await send("Input.insertText", { text });
+}
+async function tap(selector) {
+  const point = await evaluate(`(()=>{const r=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+  await send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [point] });
+  await send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+}
+async function savePreset(name) {
+  await click("#save-pokemon-preset");
+  await evaluate(`document.querySelector('#pokemon-preset-name').value=${JSON.stringify(name)};document.querySelector('#pokemon-preset-name').dispatchEvent(new Event('input'))`);
+  await click("#confirm-pokemon-preset");
+}
 async function viewport(width, height = 844, mobile = width < 600) {
   await send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile });
   await evaluate("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))");
@@ -77,10 +106,12 @@ async function noOverflow(label) {
 try {
   await send("Runtime.enable");
   await send("Page.enable");
-  await send("Fetch.enable", { patterns: [{ urlPattern: "*api/bridge*", requestStage: "Request" }] });
+  await send("Fetch.enable", { patterns: [{ urlPattern: "*api/bridge*", requestStage: "Request" }, { urlPattern: "*/config.js", requestStage: "Request" }] });
   await send("Browser.grantPermissions", { origin: "http://127.0.0.1:4173", permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
+  await send("Storage.clearDataForOrigin", { origin: "http://127.0.0.1:4173", storageTypes: "local_storage" });
+  await evaluate('document.documentElement.dataset.reloading="true"');
   await send("Page.navigate", { url: "http://127.0.0.1:4173/" });
-  await until("document.querySelector('#pokemon-picker') && !document.querySelector('#pokemon-picker').disabled");
+  await ready();
   await send("Page.bringToFront");
   for (const width of [320, 360, 375, 390, 430, 520, 768, 850, 1024, 1280]) {
     await viewport(width);
@@ -88,6 +119,104 @@ try {
   }
   console.log("PASS: initial layout at 10 widths, 320–1280px");
   await viewport(390);
+  await send("Emulation.setTouchEmulationEnabled", { enabled: true });
+  await typePokemon("");
+  for (const letter of "dratini") {
+    await send("Input.insertText", { text: letter });
+    assert.match(await evaluate('document.querySelector("#pokemon-suggestions").textContent'), /Dratini/);
+    assert.equal(await evaluate('document.querySelector("#pokemon-search").getAttribute("aria-expanded")'), "true");
+  }
+  for (const width of [320, 390, 430, 768, 1280]) { await viewport(width); await noOverflow(`autocomplete ${width}`); }
+  await viewport(390);
+  await key("ArrowDown");
+  assert.equal(await evaluate('document.querySelector("#pokemon-search").getAttribute("aria-activedescendant")'), "pokemon-suggestion-0");
+  await key("Enter");
+  assert.equal(await evaluate('document.querySelectorAll(".pokemon-chip").length'), 1);
+  await typePokemon("pika");
+  await tap("#pokemon-suggestion-0");
+  assert.equal(await evaluate('document.querySelectorAll(".pokemon-chip").length'), 2);
+  await typePokemon("raichu alola");
+  await key("ArrowUp");
+  await key("Enter");
+  assert.equal(await evaluate('document.querySelectorAll(".pokemon-chip").length'), 3);
+  await typePokemon("no-such-pokemon");
+  assert.match(await evaluate('document.querySelector("#pokemon-suggestions").textContent'), /No more matches/);
+  await key("Escape");
+  assert.equal(await evaluate('document.querySelector("#pokemon-suggestions").hidden'), true);
+  assert.equal(searchCount, 0, "Typing, selecting and Enter must not send a spawn search");
+  console.log("PASS: per-letter suggestions, touch selection, keyboard selection, empty matches and multiple species/forms use no API requests");
+  await evaluate('document.querySelector("#pokemon-mode").value="exclude";document.querySelector("#pokemon-mode").dispatchEvent(new Event("change"))');
+  const presetName = "My favorite Pokémon targets";
+  await click("#save-pokemon-preset");
+  for (const width of [320, 390, 768]) { await viewport(width); await noOverflow(`preset dialog ${width}`); }
+  await viewport(390);
+  await evaluate(`document.querySelector('#pokemon-preset-name').value=${JSON.stringify(presetName)};document.querySelector('#pokemon-preset-name').dispatchEvent(new Event('input'))`);
+  await click("#confirm-pokemon-preset");
+  const presetId = await evaluate('document.querySelector("#pokemon-preset").value');
+  assert.ok(presetId);
+  await click("button[type=reset]");
+  assert.equal(await evaluate('document.querySelectorAll(".pokemon-chip").length'), 0);
+  assert.equal(await evaluate('document.querySelector("#pokemon-preset").options.length'), 2, "Reset keeps saved presets");
+  await reload();
+  await evaluate(`document.querySelector('[name=cp_min]').value='111';document.querySelector('#pokemon-preset').value=${JSON.stringify(presetId)};document.querySelector('#pokemon-preset').dispatchEvent(new Event('change'))`);
+  await click("#load-pokemon-preset");
+  assert.equal(await evaluate('document.querySelectorAll(".pokemon-chip").length'), 3);
+  assert.equal(await evaluate('document.querySelector("#pokemon-mode").value'), "exclude");
+  assert.equal(await evaluate('document.querySelector("[name=cp_min]").value'), "111");
+  assert.equal(searchCount, 0, "Loading a preset must not search automatically");
+  await click("#search-button");
+  await until('!document.querySelector("#search-button").disabled && document.querySelectorAll(".result-card").length===23');
+  assert.deepEqual(lastPayload.blacklist_pokemon_ids, [25, 147]);
+  assert.equal(lastPayload.blacklist_species_forms[0].pokemon_id, 26);
+  assert.equal(lastPayload.blacklist_species_forms[0].form_id, 50);
+  assert.deepEqual(lastPayload.pokemon_ids, []);
+  assert.equal(lastPayload.cp_min, 111);
+  console.log("PASS: a saved list survives reload, restores species/forms and exclusion mode, preserves other filters and submits the correct payload");
+  await click('[aria-label="Remove Pikachu"]');
+  await click("#save-pokemon-preset");
+  await evaluate(`document.querySelector('#pokemon-preset-name').value=${JSON.stringify(presetName)};document.querySelector('#pokemon-preset-name').dispatchEvent(new Event('input'))`);
+  assert.equal(await evaluate('document.querySelector("#confirm-pokemon-preset").textContent'), "Update preset");
+  await click("#confirm-pokemon-preset");
+  const savedPresets = await evaluate('localStorage.getItem("pogo-pokemon-presets-v1")');
+  assert.equal(JSON.parse(savedPresets).presets.length, 1);
+  assert.equal(JSON.parse(savedPresets).presets[0].keys.length, 2);
+  await typePokemon("pika");
+  await mkdir(new URL("../.test-artifacts/", import.meta.url), { recursive: true });
+  const suggestionsImage = await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
+  await writeFile(new URL("../.test-artifacts/pokemon-lists-mobile.png", import.meta.url), Buffer.from(suggestionsImage.data, "base64"));
+  await key("Escape");
+  await click("#save-pokemon-preset");
+  await evaluate('globalThis.originalPresetSetItem=Storage.prototype.setItem;Storage.prototype.setItem=function(key,value){if(key==="pogo-pokemon-presets-v1")throw new DOMException("Quota exceeded","QuotaExceededError");return globalThis.originalPresetSetItem.call(this,key,value)};document.querySelector("#pokemon-preset-name").value="Quota failure"');
+  await click("#confirm-pokemon-preset");
+  assert.equal(await evaluate('document.querySelector("#pokemon-preset-dialog").open'), true);
+  assert.match(await evaluate('document.querySelector("#pokemon-preset-error").textContent'), /Could not save/);
+  assert.equal(await evaluate('localStorage.getItem("pogo-pokemon-presets-v1")'), savedPresets);
+  assert.equal(await evaluate('document.querySelectorAll(".pokemon-chip").length'), 2);
+  await evaluate('Storage.prototype.setItem=globalThis.originalPresetSetItem;delete globalThis.originalPresetSetItem;document.querySelector("#pokemon-preset-dialog").close();localStorage.setItem("pogo-pokemon-presets-v1","invalid saved data")');
+  await reload();
+  assert.match(await evaluate('document.querySelector("#pokemon-preset-message").textContent'), /could not be read/);
+  assert.equal(await evaluate('localStorage.getItem("pogo-pokemon-presets-v1")'), "invalid saved data");
+  assert.equal(await evaluate('document.querySelector("#pokemon-search").disabled'), false);
+  await evaluate(`localStorage.setItem('pogo-pokemon-presets-v1',${JSON.stringify(savedPresets)})`);
+  await reload();
+  await evaluate(`document.querySelector('#pokemon-preset').value=${JSON.stringify(presetId)};document.querySelector('#pokemon-preset').dispatchEvent(new Event('change'))`);
+  await click("#load-pokemon-preset");
+  await click("#delete-pokemon-preset");
+  assert.equal(await evaluate('document.querySelectorAll(".pokemon-chip").length'), 2);
+  assert.deepEqual(JSON.parse(await evaluate('localStorage.getItem("pogo-pokemon-presets-v1")')).presets, []);
+  console.log("PASS: removing a Pokémon, updating/deleting a preset, quota failure and corrupt storage preserve the correct saved/current data");
+  const blockedStorageScript = await send("Page.addScriptToEvaluateOnNewDocument", { source: 'Storage.prototype.getItem=function(){throw new DOMException("Storage blocked","SecurityError")}' });
+  await reload();
+  assert.match(await evaluate('document.querySelector("#pokemon-preset-message").textContent'), /storage is blocked/);
+  assert.equal(await evaluate('document.querySelector("#connection-notice").hidden'), true);
+  await typePokemon("dratini");
+  await key("Enter");
+  await click("#search-button");
+  await until('!document.querySelector("#search-button").disabled && document.querySelectorAll(".result-card").length===23');
+  assert.deepEqual(lastPayload.pokemon_ids, [147]);
+  await send("Page.removeScriptToEvaluateOnNewDocument", { identifier: blockedStorageScript.identifier });
+  console.log("PASS: blocked browser storage disables saved presets while Pokémon selection and the configured search service still work");
+  await reload();
   await click("#pokemon-picker");
   await evaluate("document.querySelector('#picker-search').value='Dratini';document.querySelector('#picker-search').dispatchEvent(new Event('input'))");
   await click(".picker-option input");
