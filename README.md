@@ -31,7 +31,7 @@ The provider rejects the GitHub Pages origin in its CORS policy. GitHub Pages se
 
 ### GitHub Pages
 
-This repository is private under the personal `robert-gherman` account. GitHub Pages from a private personal repository requires GitHub Pro; GitHub Free supports Pages only from public repositories. Keep the source private. If the account does not include private-repository Pages, deploy the whole site and bridge on Vercel's free personal plan instead. A private source repository does not make a published Pages website private.
+This repository is public under the personal `robert-gherman` account and uses free GitHub Pages at https://robert-gherman.github.io/poke-result-monitor/. Only static website assets are published; the API bridge must be deployed separately as described below.
 
 Push this directory as the repository root. Publish just [site](./site/) to a `gh-pages` branch and select that branch, path `/`, in Settings → Pages. All asset paths are relative, so both a root site and `/poke-result-monitor/` work. Do not copy the parent monitor's private files into this repository.
 
