@@ -1,4 +1,4 @@
-name = "robert-pokesearch-api"
+name = "poke-result-monitor"
 main = "server/worker.mjs"
 compatibility_date = "2026-11-01"
 
